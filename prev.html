@@ -6,25 +6,140 @@
   <title>RTSP → WebRTC Viewer</title>
   <script defer>
     document.addEventListener("DOMContentLoaded", () => {
-      console.log("DOMContentLoaded event fired."); // New log
+      console.log("DOMContentLoaded event fired.");
       const wsUrl = `ws://localhost:8080/ws`;
-      const video = document.getElementById("remoteVideo");
+      // const video = document.getElementById("remoteVideo"); // video要素の代わりにcanvasを使用
+      const canvas = document.getElementById("remoteCanvas"); // canvas要素を取得
+      const ctx = canvas.getContext("2d"); // 2Dコンテキストを取得
       const ws = new WebSocket(wsUrl);
       let pc;
+      let videoDecoder; // Make videoDecoder accessible in broader scope
+      let videoDataChannel;
 
       ws.addEventListener("open", async () => {
-        console.log("WebSocket connection opened."); // New log
+        console.log("WebSocket connection opened.");
         try {
           pc = new RTCPeerConnection({
             iceServers: [
               { urls: "stun:stun.l.google.com:19302" }
             ], // Googleの公開STUNサーバーを使用
+            iceTransportPolicy: 'all',      // UDP 優先
+            bundlePolicy: 'max-bundle',     // 1 つの流路にまとめる
+            rtcpMuxPolicy: 'require'        // RTC 用ポートを共用
           });
-          console.log("RTCPeerConnection created."); // New log
+          console.log("RTCPeerConnection created."); 
+
+          // Initialize VideoDecoder
+          if (!videoDecoder) {
+            videoDecoder = new VideoDecoder({
+              output: (videoFrame) => {
+                console.log("VideoDecoder output:", videoFrame); 
+                 if (canvas.width !== videoFrame.displayWidth || canvas.height !== videoFrame.displayHeight) {
+                  canvas.width = videoFrame.displayWidth;
+                  canvas.height = videoFrame.displayHeight;
+                  console.log("Canvas resized to:", canvas.width, "x", canvas.height); 
+                }
+                ctx.drawImage(videoFrame, 0, 0, videoFrame.displayWidth, videoFrame.displayHeight);
+                console.log("Drew frame to canvas:", videoFrame.timestamp); 
+                videoFrame.close(); 
+              },
+              error: (err) => {
+                console.error("VideoDecoder error:", err);
+              }
+            });
+
+            try {
+              videoDecoder.configure({
+                codec: 'avc1.42e01f',
+                optimizeForLatency: true,
+                hardwareAcceleration: 'prefer-hardware'
+              });
+              console.log("VideoDecoder configured successfully.");
+            } catch (err) {
+              console.error("Failed to configure VideoDecoder:", err);
+            }
+          }
+
+          videoDataChannel = pc.createDataChannel("videoNaluChannel", { ordered: false, maxRetransmits: 0,priority: 'high'  });
+          console.log("videoDataChannel created:", videoDataChannel);
+
+          videoDataChannel.onopen = () => {
+            console.log("videoDataChannel 'videoNaluChannel' opened");
+          };
+
+          videoDataChannel.onclose = () => {
+            console.log("videoDataChannel 'videoNaluChannel' closed");
+          };
+
+          videoDataChannel.onerror = (error) => {
+            console.error("videoDataChannel 'videoNaluChannel' error:", error);
+          };
+
+          let pendingSPS, pendingPPS;
+
+          let spsNal = null;
+          let ppsNal = null;
+
+          videoDataChannel.onmessage = ({ data }) => {
+            if (typeof data !== 'string') return; 
+            const msg = JSON.parse(data);
+            const nalu = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+
+            // 4 byte スタートコードを付けて Annex-B 形式で結合するヘルパ
+            const annexB = (...nalus) => {
+              const sc = new Uint8Array([0, 0, 0, 1]);
+              const size = nalus.reduce((s, n) => s + 4 + n.length, 0);
+              const buf  = new Uint8Array(size);
+              let off = 0;
+              for (const n of nalus) { buf.set(sc, off); off += 4; buf.set(n, off); off += n.length; }
+              return buf;
+            };
+
+            switch (msg.type) {
+              case 'sps':
+                spsNal = nalu;
+                return;                         // decode しない
+              case 'pps':
+                ppsNal = nalu;
+                return;
+              case 'key': {                     // IDR
+                if (!spsNal || !ppsNal) {
+                  console.warn('SPS/PPS 未受信のままキーを受け取りました。スキップします');
+                  return;
+                }
+
+                // ★ デコーダが未設定ならここで configure（description は必須ではない）
+                if (videoDecoder.state !== 'configured') {
+                  videoDecoder.configure({
+                    codec: 'avc1.42e01f',
+                    optimizeForLatency: true,
+                    hardwareAcceleration: 'prefer-hardware'
+                  });
+                }
+
+                // SPS + PPS + IDR を 1 つのアクセスユニットにする
+                const au = annexB(spsNal, ppsNal, nalu);
+                videoDecoder.decode(new EncodedVideoChunk({
+                  type: 'key',
+                  timestamp: msg.timestamp * 1000,   // ms → µs
+                  data: au,
+                }));
+                break;
+              }
+              case 'delta': {
+                if (videoDecoder.state !== 'configured') return;
+                videoDecoder.decode(new EncodedVideoChunk({
+                  type: 'delta',
+                  timestamp: msg.timestamp * 1000,
+                  data: annexB(nalu),
+                }));
+                break;
+              }
+            }
+          };
 
           pc.onicecandidateerror = (event) => {
             console.error("ICE candidate error event:", event);
-            // RTCPeerConnectionIceErrorEvent has details like address, port, url, errorCode, errorText
             if (event.url && event.errorCode && event.errorText) {
               console.error(`ICE Candidate Error: URL=${event.url}, Code=${event.errorCode}, Text=${event.errorText}`);
             }
@@ -35,13 +150,14 @@
           };
 
           pc.ontrack = (e) => {
-            console.log("pc.ontrack event:", e); // New log
-            if (video.srcObject !== e.streams[0]) video.srcObject = e.streams[0];
+            console.log("pc.ontrack event:", e); 
+            if (e.track.kind === 'audio') {
+              console.log("Received audio track:", e.track);
+            }
           };
 
           // ICE候補が見つかったらサーバーに送信
           pc.onicecandidate = ({ candidate }) => {
-            // console.log("pc.onicecandidate event:", candidate); // ログは維持しても良い
             if (candidate) {
               console.log("Sending ICE candidate:", candidate.candidate); 
               ws.send(JSON.stringify({ type: "candidate", candidate: candidate.candidate }));
@@ -50,14 +166,14 @@
             }
           };
 
-          console.log("Creating offer..."); // New log
+          console.log("Creating offer...");
           const offer = await pc.createOffer({ offerToReceiveVideo: true }); 
-          console.log("Offer created:", offer); // New log          
-          console.log("Setting local description with offer..."); // New log 
+          console.log("Offer created:", offer);         
+          console.log("Setting local description with offer...");
           try {
             await pc.setLocalDescription(offer);
-            console.log("Local description set successfully."); // New log
-            console.log("pc.localDescription after setLocalDescription:", pc.localDescription); // New log
+            console.log("Local description set successfully.");
+            console.log("pc.localDescription after setLocalDescription:", pc.localDescription); 
             
             // オファーをサーバーに送信
             if (pc.localDescription && pc.localDescription.sdp) {
@@ -69,7 +185,7 @@
               
               if (offerPayloadString && offerPayloadString !== "{}") { 
                 ws.send(offerPayloadString);
-                console.log("Offer sent to server."); // New log
+                console.log("Offer sent to server."); 
               } else {
                 console.error("Offer payload string is empty or invalid. Not sending. Payload:", offerPayloadString);
               }
@@ -79,13 +195,7 @@
 
           } catch (err) {
             console.error("Error setting local description or sending offer:", err);
-            // throw err; // 必要に応じてエラーを再スロー
           }
-          
-          // 以下の複雑なICE収集待機ロジックは不要になったため削除します。
-          // pc.onicecandidate ハンドラがICE候補を非同期に送信します。
-          // 以前の await new Promise(...) ブロック全体を削除。
-          // 以前のオファー送信ロジックも setLocalDescription の直後に移動済み。
 
         } catch (error) {
           console.error("Error in WebSocket 'open' handler:", error); 
@@ -135,12 +245,14 @@
     body { 
         background-color: #111827; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;
     }
-    video { 
+    /* video 要素のスタイルを canvas にも適用できるように変更 */
+    canvas { 
         width: 100%; max-width: 64rem; border-radius: 1rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05);
     }
   </style>
 </head>
 <body>
-  <video id="remoteVideo" autoplay playsinline muted disablePictureInPicture disableRemotePlayback preload="metadata"></video>
+  <!-- <video id="remoteVideo" autoplay playsinline muted disablePictureInPicture disableRemotePlayback preload="metadata"></video> -->
+  <canvas id="remoteCanvas"></canvas> <!-- video要素をcanvas要素に変更 -->
 </body>
 </html>
