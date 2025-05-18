@@ -94,8 +94,6 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 
 func startFFmpeg(rtspURL string) {
 	cmd := exec.Command("ffmpeg",
-		// "-probesize", "64",
-		"-analyzeduration", "0",
 		"-avioflags", "direct",
 		"-flags", "low_delay",
 		"-fflags", "+igndts+nobuffer",
@@ -116,7 +114,7 @@ func startFFmpeg(rtspURL string) {
 	// 	log.Fatal(err)
 	// }
 
-	rdr, _ := h264reader.NewReader(bufio.NewReader(stdout))
+	rdr, _ := h264reader.NewReader(bufio.NewReaderSize(stdout, 4096)) // バッファサイズを小さくする
 	dur := time.Second / 30
 
 	for {
