@@ -94,22 +94,27 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 
 func startFFmpeg(rtspURL string) {
 	cmd := exec.Command("ffmpeg",
-		"-fflags", "+igndts",
+		// "-probesize", "64",
+		"-analyzeduration", "0",
+		"-avioflags", "direct",
+		"-flags", "low_delay",
+		"-fflags", "+igndts+nobuffer",
 		"-vsync", "0",
 		"-rtsp_transport", "tcp",
 		"-i", rtspURL,
-		"-c:v", "copy",
-		"-an",
+		"-c:v", "copy", "-an",
 		"-f", "h264",
 		"pipe:1",
 	)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		log.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		log.Fatal(err)
-	}
+	stdout, _ := cmd.StdoutPipe()
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// if  err :=
+	  cmd.Start();
+	//   err != nil {
+	// 	log.Fatal(err)
+	// }
 
 	rdr, _ := h264reader.NewReader(bufio.NewReader(stdout))
 	dur := time.Second / 30
