@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"log"
 	"net/http"
 	"os/exec"
@@ -23,15 +24,26 @@ var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { retu
 var (
 	tracks     = make([]*webrtc.TrackLocalStaticSample, 0)
 	trackMutex sync.RWMutex
+	rtspURL                 string
+	serverPort              string
 )
 
+
 func main() {
-	rtspURL := "rtsp://admin:admin@192.168.40.118:1935"
+	flag.StringVar(&rtspURL, "rtsp-url", "rtsp://admin:admin@192.168.40.118:1935", "RTSP URL for the camera")
+	flag.StringVar(&serverPort, "port", "8080", "Server port") // 追加
+	flag.Parse()
+
+	if rtspURL == "" {
+		log.Fatal("RTSP URL must be provided via the -rtsp-url flag")
+	}
+
+	log.Printf("Using RTSP URL: %s", rtspURL)
 	go startFFmpeg(rtspURL)
 
 	http.HandleFunc("/ws", signalingHandler)
-	log.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Printf("Server started on :%s", serverPort) // 変更
+	log.Fatal(http.ListenAndServe(":"+serverPort, nil)) // 変更
 }
 
 func signalingHandler(w http.ResponseWriter, r *http.Request) {
