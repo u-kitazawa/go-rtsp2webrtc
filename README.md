@@ -1,4 +1,4 @@
-# GO RTSP 2 WebRTC
+# RTSP 2 WebRTC
 
 ## 概要
 
