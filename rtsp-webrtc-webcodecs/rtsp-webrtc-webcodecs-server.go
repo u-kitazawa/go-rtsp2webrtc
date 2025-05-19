@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/json"
-	"flag" // 追加
+	"flag"
 	"io"
 	"log"
 	"net/http"
@@ -23,14 +23,14 @@ var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { retu
 var (
 	currentVideoDataChannel *webrtc.DataChannel
 	dataChannelMutex        sync.RWMutex
-	rtspURL                 string
-	serverPort              string // 追加
+	rtspURL	string
+	serverPort	string
 )
 
 
 func main() {
 	flag.StringVar(&rtspURL, "rtsp-url", "rtsp://admin:admin@192.168.40.118:1935", "RTSP URL for the camera")
-	flag.StringVar(&serverPort, "port", "8080", "Server port") // 追加
+	flag.StringVar(&serverPort, "port", "8080", "Server port")
 	flag.Parse()
 
 	if rtspURL == "" {
@@ -41,8 +41,8 @@ func main() {
 	go startFFmpeg(rtspURL)
 
 	http.HandleFunc("/ws", signalingHandler)
-	log.Printf("Server started on :%s", serverPort) // 変更
-	log.Fatal(http.ListenAndServe(":"+serverPort, nil)) // 変更
+	log.Printf("Server started on :%s", serverPort)
+	log.Fatal(http.ListenAndServe(":"+serverPort, nil))
 }
 
 func signalingHandler(w http.ResponseWriter, r *http.Request) {
@@ -130,18 +130,16 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, msg, err := ws.ReadMessage()
 		if err != nil {
-			// Log the actual error that caused the ReadMessage loop to exit
 			log.Printf("Error reading message from WebSocket: %v. Closing WebSocket.", err)
-			// Check for specific WebSocket closure errors
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
 				log.Printf("WebSocket unexpectedly closed: %v", err)
 			}
-			break // Exit loop, defer will close ws and pc
+			break
 		}
 		var p map[string]interface{}
-		if err := json.Unmarshal(msg, &p); err != nil { // Added error handling for unmarshal
+		if err := json.Unmarshal(msg, &p); err != nil {
 			log.Printf("Error unmarshalling message: %v. Message: %s", err, string(msg))
-			continue // Skip malformed message
+			continue 
 		}
 
 		switch p["type"] {
@@ -151,7 +149,7 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 				log.Printf("Invalid offer format: sdp is not a string. Payload: %v", p)
 				continue
 			}
-			log.Println("Received offer") // Log offer receipt
+			log.Println("Received offer")
 			if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdp}); err != nil {
 				log.Printf("Failed to set remote description (offer): %v", err)
 				continue
@@ -168,7 +166,6 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			
-			// Wait for ICE Gathering to complete
 			<-webrtc.GatheringCompletePromise(pc)
 			log.Println("ICE Gathering complete. Sending answer.") 
 
@@ -203,11 +200,11 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Received unknown message type: %s", p["type"])
 		}
 	}
-	log.Println("Exiting signalingHandler.") // Log when handler exits
+	log.Println("Exiting signalingHandler.")
 }
 
 func startFFmpeg(rtspURL string) {
-	log.Printf("Starting FFmpeg for RTSP URL: %s\\n", rtspURL)
+	log.Printf("Starting FFmpeg for RTSP URL: %s", rtspURL)
 	cmd := exec.Command("ffmpeg",
 		"-hide_banner", // Optional: cleans up FFmpeg startup logs
 		"-avioflags", "direct",
@@ -230,18 +227,18 @@ func startFFmpeg(rtspURL string) {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("Error creating stdout pipe for FFmpeg: %v\\n", err)
+		log.Printf("Error creating stdout pipe for FFmpeg: %v", err)
 		return
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		log.Printf("Error creating stderr pipe for FFmpeg: %v\\n", err)
+		log.Printf("Error creating stderr pipe for FFmpeg: %v", err)
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("Error starting FFmpeg: %v\\n", err)
+		log.Printf("Error starting FFmpeg: %v", err)
 		return
 	}
 	log.Println("FFmpeg process started.")
@@ -251,7 +248,7 @@ func startFFmpeg(rtspURL string) {
 		for scanner.Scan() {
 		}
 		if err := scanner.Err(); err != nil {
-			log.Printf("Error reading FFmpeg stderr: %v\\n", err)
+			log.Printf("Error reading FFmpeg stderr: %v", err)
 		}
 		log.Println("FFmpeg stderr stream finished.")
 	}()
@@ -259,8 +256,8 @@ func startFFmpeg(rtspURL string) {
 	h264BufReader := bufio.NewReaderSize(stdout, 1024*64) 
 	rdr, err := h264reader.NewReader(h264BufReader)
 	if err != nil {
-		log.Printf("Error creating H264 reader: %v\\n", err)
-			if cmd.Process != nil {
+		log.Printf("Error creating H264 reader: %v", err)
+		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
 		cmd.Wait() 
@@ -299,7 +296,7 @@ func startFFmpeg(rtspURL string) {
 
 		jsonData, err := json.Marshal(payload)
 		if err != nil {
-			log.Printf("Error marshalling NALU payload: %v\\n", err)
+			log.Printf("Error marshalling NALU payload: %v", err)
 			continue
 		}
 
@@ -309,11 +306,11 @@ func startFFmpeg(rtspURL string) {
 
 		if dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen {
 
-			
+		
 			err := dc.SendText(string(jsonData))
 			if err != nil {
-				log.Printf("Error writing NALU data to DataChannel (type: %s): %v\\n", naluType, err)
-			} 
+				log.Printf("Error writing NALU data to DataChannel (type: %s): %v", naluType, err)
+			}
 		} else {
 			time.Sleep(2 * time.Millisecond)
 		}
@@ -323,7 +320,7 @@ func startFFmpeg(rtspURL string) {
 	if cmd.Process != nil {
 		log.Println("Waiting for FFmpeg process to exit...")
 		if err := cmd.Wait(); err != nil { 
-			log.Printf("FFmpeg process exited with error: %v\\n", err)
+			log.Printf("FFmpeg process exited with error: %v", err)
 		} else {
 			log.Println("FFmpeg process exited successfully.")
 		}
