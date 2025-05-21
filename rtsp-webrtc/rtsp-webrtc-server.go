@@ -4,17 +4,15 @@ import (
 	"bufio"
 	"encoding/json"
 	"flag"
+	"io"
 	"log"
-	"net"
 	"net/http"
 	"os/exec"
-	"strconv"
-	"strings" // Added for strings.Join
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pion/rtp" // Required for RTP packet handling for H.265 to H.264 transcoding
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/pion/webrtc/v3/pkg/media/h264reader"
@@ -25,20 +23,17 @@ var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { retu
 
 // concurrent-safe track list
 var (
-	tracksSample     = make([]*webrtc.TrackLocalStaticSample, 0) // For H.264 direct
-	tracksRTP        = make([]*webrtc.TrackLocalStaticRTP, 0)   // For H.265 to H.264 transcoded RTP
-	trackMutex       sync.RWMutex
-	rtspURL          string
-	serverPort       string
-	codec            string // "h264" or "h265"
-	rtpPort          int    // Port for FFmpeg to send RTP to (used with "h265" codec)
+	tracksSample = make([]*webrtc.TrackLocalStaticSample, 0) // Unified tracks list for H.264 samples
+	trackMutex   sync.RWMutex
+	rtspURL      string
+	serverPort   string
+	codec        string // "h264" or "h265"
 )
 
 func main() {
 	flag.StringVar(&rtspURL, "rtsp-url", "rtsp://admin:admin@192.168.40.118:1935", "RTSP URL for the camera")
 	flag.StringVar(&serverPort, "port", "8080", "Server port")
-	flag.StringVar(&codec, "codec", "h264", "Codec to use for RTSP input (h264 or h265). H.265 will be transcoded to H.264.")
-	flag.IntVar(&rtpPort, "rtp-port", 5004, "UDP port for receiving H.264 RTP from FFmpeg (used with h265 codec)")
+	flag.StringVar(&codec, "codec", "h264", "Codec to use for RTSP input (h264 or h265). H.265 will be transcoded to H.264 NALs.")
 	flag.Parse()
 
 	if rtspURL == "" {
@@ -50,8 +45,8 @@ func main() {
 	if codec == "h264" {
 		go startFFmpegH264(rtspURL)
 	} else if codec == "h265" {
-		log.Printf("H.265 input selected. FFmpeg will transcode to H.264 and send via RTP to port %d", rtpPort)
-		go startFFmpegH265AndRTPListener(rtspURL, rtpPort)
+		log.Printf("H.265 input selected. FFmpeg will transcode to H.264 NAL units.")
+		go startFFmpegH265ToH264NAL(rtspURL)
 	} else {
 		log.Fatalf("Unsupported codec: %s. Choose 'h264' or 'h265'", codec)
 	}
@@ -71,10 +66,9 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 
 	// setup PeerConnection
 	m := &webrtc.MediaEngine{}
-	// FFmpeg will output H.264 in both cases (direct for H.264 input, transcoded for H.265 input)
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: "profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1"},
-		PayloadType:        96, // This should match the payload type used by FFmpeg
+		PayloadType:        96, 
 	}, webrtc.RTPCodecTypeVideo); err != nil {
 		log.Printf("Failed to register H264 codec: %v", err)
 		return
@@ -91,65 +85,42 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if codec == "h264" {
-		track, trackErr := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000}, "video", "pion")
-		if trackErr != nil {
-			log.Printf("Failed to create NewTrackLocalStaticSample: %v", trackErr)
-			return
-		}
-		_, addTrackErr := pc.AddTrack(track)
-		if addTrackErr != nil {
-			log.Printf("Failed to add H.264 sample track to PeerConnection: %v", addTrackErr)
-			return
-		}
-		// register track
-		trackMutex.Lock()
-		tracksSample = append(tracksSample, track)
-		trackMutex.Unlock()
-		defer func() {
-			trackMutex.Lock()
-			for i, t := range tracksSample {
-				if t == track {
-					tracksSample = append(tracksSample[:i], tracksSample[i+1:]...)
-					break
-				}
-			}
-			trackMutex.Unlock()
-		}()
-	} else if codec == "h265" {
-		track, trackErr := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000}, "video", "pion")
-		if trackErr != nil {
-			log.Printf("Failed to create NewTrackLocalStaticRTP: %v", trackErr)
-			return
-		}
-		rtpSender, addTrackErr := pc.AddTrack(track)
-		if addTrackErr != nil {
-			log.Printf("Failed to add H.264 RTP track to PeerConnection: %v", addTrackErr)
-			return
-		}
-		go func() {
-			rtcpBuf := make([]byte, 1500)
-			for {
-				if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
-					return
-				}
-			}
-		}()
-		// register track
-		trackMutex.Lock()
-		tracksRTP = append(tracksRTP, track)
-		trackMutex.Unlock()
-		defer func() {
-			trackMutex.Lock()
-			for i, t := range tracksRTP {
-				if t == track {
-					tracksRTP = append(tracksRTP[:i], tracksRTP[i+1:]...)
-					break
-				}
-			}
-			trackMutex.Unlock()
-		}()
+	// Unified track creation for both H.264 and H.265 (transcoded to H.264 NALs)
+	track, trackErr := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000}, "video", "pion")
+	if trackErr != nil {
+		log.Printf("Failed to create NewTrackLocalStaticSample: %v", trackErr)
+		return
 	}
+	rtpSender, addTrackErr := pc.AddTrack(track) // rtpSender is needed for RTCP handling
+	if addTrackErr != nil {
+		log.Printf("Failed to add H.264 sample track to PeerConnection: %v", addTrackErr)
+		return
+	}
+
+	// Goroutine to read RTCP packets from the rtpSender.
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
+
+	// register track
+	trackMutex.Lock()
+	tracksSample = append(tracksSample, track) 
+	trackMutex.Unlock()
+	defer func() {
+		trackMutex.Lock()
+		for i, t := range tracksSample {
+			if t == track {
+				tracksSample = append(tracksSample[:i], tracksSample[i+1:]...)
+				break
+			}
+		}
+		trackMutex.Unlock()
+	}()
 
 	// WebSocket message loop
 	for {
@@ -224,9 +195,10 @@ func startFFmpegH264(rtspURL string) {
 		"-flags", "low_delay",
 		"-fflags", "+igndts+nobuffer",
 		"-i", rtspURL,
-// 出力
-		"-c:v", "copy", "-an", // Copy H.264 video, no audio
-		"-fps_mode", "passthrough", // Moved before -i
+		// 出力
+		"-c:v", "copy", "-an",
+		
+		"-fps_mode", "passthrough", 
 		"-bsf:v", "h264_metadata=aud=insert",
 		"-flush_packets", "1",
 		"-f", "h264",
@@ -262,7 +234,7 @@ func startFFmpegH264(rtspURL string) {
 	}()
 
 	rdr, _ := h264reader.NewReader(bufio.NewReaderSize(stdout, 4096))
-	dur := time.Second / 30 // Assuming 30 FPS, adjust if necessary
+	dur := time.Second / 30 
 
 	for {
 		nal, err := rdr.NextNAL()
@@ -275,111 +247,118 @@ func startFFmpegH264(rtspURL string) {
 		trackMutex.RLock()
 		for _, t := range tracksSample {
 			if err := t.WriteSample(media.Sample{Data: data, Duration: dur}); err != nil {
-				// log.Printf("Error writing sample to H.264 track: %v", err) // Can be verbose
 			}
 		}
 		trackMutex.RUnlock()
 	}
 }
 
-// startFFmpegH265AndRTPListener starts FFmpeg to transcode H.265 RTSP to H.264 RTP
-// and listens on a UDP port for these RTP packets, writing them to the WebRTC tracks.
-func startFFmpegH265AndRTPListener(rtspURL string, rtpListenPort int) {
+// startFFmpegH265ToH264NAL starts FFmpeg to transcode H.265 RTSP to H.264 NAL units
+// and pipes them to the WebRTC tracks.
+func startFFmpegH265ToH264NAL(rtspURL string) {
 	cmdArgs := []string{
-		"-rtsp_transport", "tcp", // Consider making this configurable or testing udp
-		"-probesize", "32",       // May need adjustment based on stream
-		"-analyzeduration", "500000", // May need adjustment
-		"-fflags", "nobuffer",
-		"-i", rtspURL, // Input H.265 RTSP stream
-		"-an",         // No audio
-		"-c:v", "libx264",
-		"-preset", "ultrafast", // Balances CPU and latency. Consider "superfast" or "veryfast" for better quality if CPU allows.
-		"-tune", "zerolatency", // Good for low latency
-		"-threads", "auto", // Utilize available CPU cores for encoding
-		"-pix_fmt", "yuv420p",
-		"-payload_type", "96", // Must match WebRTC MediaEngine
-		"-fps_mode", "passthrough",
-		"-f", "rtp",
+    // ── 取り込み ──
+    "-rtsp_transport", "tcp",
+    "-probesize", "250000",           // 既定 5000000 をかなり縮小（起動 0.1 秒台）
+    "-analyzeduration", "0",
+    "-fflags", "nobuffer+flush_packets+genpts",
+    "-flags", "low_delay",
+    "-max_delay", "0",
 
-		"rtp://127.0.0.1:" + strconv.Itoa(rtpListenPort), // Consider making IP configurable
-	}
+    // ── NVDEC: 0-copy でデコード ──
+    "-hwaccel", "cuda",
+    "-hwaccel_output_format", "cuda", // ★ メモリコピーを避ける
+    "-i", rtspURL,
+    "-an",
+		
+    // ── NVENC ──
+    "-c:v", "h264_nvenc",
+    "-preset", "p1",                  // 最速
+    "-tune", "ll",                    // low-latency
+    "-delay", "0",                    // CPB を空にする（追加遅延 0）
+    "-rc:v", "cbr", "-b:v", "6M",     // レート一定（可変でも可）
+    "-g", "30", "-bf", "0",
+		
+    // ── 時間情報 ──
+    "-fps_mode", "passthrough",       // PTS/DTS は genpts の値をそのまま
+		//  (vsync ではなく fps_mode を推奨)
+		
+    // ── フレーム境界を保証 ──
+    "-bsf:v", "h264_metadata=aud=insert",
+		
+    "-map", "0:v:0",
+    "-f", "h264", "pipe:1",
+}
+
+
 	cmd := exec.Command("ffmpeg", cmdArgs...)
 
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Fatalf("Failed to get stdout pipe for FFmpeg (H.265->H.264 NAL): %v", err)
+	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		// If getting stderr pipe fails, we can still try to start FFmpeg,
-		// but we won't get its error output directly.
-		log.Printf("Warning: Failed to get stderr pipe for FFmpeg (H.265->H.264): %v. FFmpeg errors might not be logged.", err)
+		log.Printf("Warning: Failed to get stderr pipe for FFmpeg (H.265->H.264 NAL): %v. FFmpeg errors might not be logged.", err)
 	} else {
 		go func() {
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
-				log.Printf("FFmpeg (H.265->H.264): %s", scanner.Text())
+				log.Printf("FFmpeg (H.265->H.264 NAL): %s", scanner.Text())
 			}
-			// Check for scanner errors, though rare for stderr.
 			if scanErr := scanner.Err(); scanErr != nil {
-				log.Printf("Error reading FFmpeg stderr: %v", scanErr)
+				log.Printf("Error reading FFmpeg stderr (H.265->H.264 NAL): %v", scanErr)
 			}
 		}()
 	}
 
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("Failed to start FFmpeg (H.265->H.264): %v. Command: ffmpeg %s", err, strings.Join(cmdArgs, " ")) // Log the full command
+		log.Fatalf("Failed to start FFmpeg (H.265->H.264 NAL): %v. Command: ffmpeg %s", err, strings.Join(cmdArgs, " "))
 	}
-	log.Printf("FFmpeg (H.265->H.264) process started. Transcoding from %s to H.264 RTP on 127.0.0.1:%d", rtspURL, rtpListenPort)
+	log.Printf("FFmpeg (H.265->H.264 NAL) process started. Transcoding from %s to H.264 NALs.", rtspURL)
 
-	// Goroutine to wait for FFmpeg command to finish and log its exit status
 	go func() {
 		if err := cmd.Wait(); err != nil {
-			log.Printf("FFmpeg (H.265->H.264) command finished with error: %v", err)
+			log.Printf("FFmpeg (H.265->H.264 NAL) command finished with error: %v", err)
 		} else {
-			log.Println("FFmpeg (H.265->H.264) command finished successfully.")
+			log.Println("FFmpeg (H.265->H.264 NAL) command finished successfully.")
 		}
 	}()
 
-	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: rtpListenPort})
+	// Use a buffered reader for stdout
+	h264BufReader := bufio.NewReaderSize(stdout, 4096*2) 
+	h264r, err := h264reader.NewReader(h264BufReader)
 	if err != nil {
-		log.Fatalf("Failed to listen on UDP port %d for RTP: %v", rtpListenPort, err)
+		log.Printf("Failed to create H264 reader for H.265->H.264 NAL stream: %v", err)
+		return 
 	}
-	defer listener.Close()
 
-	log.Printf("Listening for H.264 RTP packets (from H.265 transcode) on UDP 127.0.0.1:%d", rtpListenPort)
+	// Assuming 30 FPS for sample duration. Adjust if necessary or obtain dynamically.
+	dur := time.Second / 30
 
-	rtpBuf := make([]byte, 2048) // Buffer for incoming RTP packets
 	for {
-		n, _, err := listener.ReadFromUDP(rtpBuf)
+		nal, err := h264r.NextNAL()
+		if err == io.EOF {
+			log.Println("FFmpeg (H.265->H.264 NAL) stdout EOF.")
+			break
+		}
 		if err != nil {
-			// If the listener is closed, this error is expected, so we can break the loop.
-			// For other errors, log and continue.
-			if netErr, ok := err.(net.Error); ok && !netErr.Temporary() && !netErr.Timeout() {
-				log.Printf("UDP listener error, closing RTP listener: %v", err)
-				break // Exit loop if it's a permanent error (e.g. listener closed)
-			}
-			log.Printf("Error reading RTP from UDP: %v", err)
-			continue
+			log.Printf("Error reading NAL unit (H.265->H.264 NAL): %v", err)
+			break
 		}
 
-		packet := &rtp.Packet{}
-		if err := packet.Unmarshal(rtpBuf[:n]); err != nil {
-			log.Printf("Error unmarshalling RTP packet: %v", err)
-			continue
-		}
+		sample := media.Sample{Data: nal.Data, Duration: dur}
 
 		trackMutex.RLock()
-		// Optimization: if there are no tracks, don't try to write.
-		if len(tracksRTP) == 0 {
+		if len(tracksSample) == 0 {
 			trackMutex.RUnlock()
-			// Optional: Add a small sleep here if this state is common and CPU usage is a concern.
-			// time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		for _, t := range tracksRTP {
-			if writeErr := t.WriteRTP(packet); writeErr != nil {
-				// This log can be very verbose. Enable if debugging track writing issues.
-				log.Printf("Error writing RTP to track: %v, Track: %s, Codec: %s", writeErr, t.ID(), t.Codec().MimeType)
-			}
+		for _, t := range tracksSample {
+			if writeErr := t.WriteSample(sample); writeErr != nil {
+		}
 		}
 		trackMutex.RUnlock()
 	}
-	log.Printf("Stopped listening for H.264 RTP packets on UDP 127.0.0.1:%d", rtpListenPort)
+	log.Println("Stopped processing H.264 NALs from FFmpeg (H.265 input).")
 }
