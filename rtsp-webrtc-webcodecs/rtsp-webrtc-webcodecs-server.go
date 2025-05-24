@@ -17,7 +17,7 @@ import (
 	"github.com/pion/webrtc/v3/pkg/media/h264reader"
 )
 
-// WebSocket upgrader
+// WebSocketアップグレーダー
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 var (
@@ -29,34 +29,34 @@ var (
 
 
 func main() {
-	flag.StringVar(&rtspURL, "rtsp-url", "rtsp://admin:admin@192.168.40.118:1935", "RTSP URL for the camera")
-	flag.StringVar(&serverPort, "port", "8080", "Server port")
+	flag.StringVar(&rtspURL, "rtsp-url", "rtsp://admin:admin@192.168.40.118:1935", "カメラのRTSP URL")
+	flag.StringVar(&serverPort, "port", "8080", "サーバーポート")
 	flag.Parse()
 
 	if rtspURL == "" {
-		log.Fatal("RTSP URL must be provided via the -rtsp-url flag")
+		log.Fatal("RTSP URLは -rtsp-url フラグで指定する必要があります")
 	}
 
-	log.Printf("Using RTSP URL: %s", rtspURL)
+	log.Printf("RTSP URLを使用: %s", rtspURL)
 	go startFFmpeg(rtspURL)
 
 	http.HandleFunc("/ws", signalingHandler)
-	log.Printf("Server started on :%s", serverPort)
+	log.Printf("サーバーが :%s で起動しました", serverPort)
 	log.Fatal(http.ListenAndServe(":"+serverPort, nil))
 }
 
 func signalingHandler(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Failed to upgrade to WebSocket: %v", err)
+		log.Printf("WebSocketへのアップグレードに失敗しました: %v", err)
 		return
 	}
 	defer func() {
-		log.Println("Closing WebSocket connection in defer.")
+		log.Println("deferでWebSocket接続を閉じています。")
 		ws.Close()
 	}()
 
-	// setup PeerConnection
+	// PeerConnectionのセットアップ
 	m := &webrtc.MediaEngine{}
 	m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: "profile-level-id=42e01f;level-asymmetry-allowed=1;packetization-mode=1"},
@@ -65,80 +65,84 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}})
 	if err != nil {
-		log.Printf("Failed to create PeerConnection: %v", err)
+		log.Printf("PeerConnectionの作成に失敗しました: %v", err)
 		return
 	}
 	defer func() {
-		log.Println("Closing PeerConnection in defer.")
+		log.Println("deferでPeerConnectionを閉じています。")
 		if pc != nil {
 			if err := pc.Close(); err != nil {
-				log.Printf("Failed to close PeerConnection: %v", err)
+				log.Printf("PeerConnectionを閉じる際にエラーが発生しました: %v", err)
 			}
 		}
 	}()
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("PeerConnection ICE Connection State has changed: %s\\n", state.String())
+		log.Printf("PeerConnection ICE接続状態が変更されました: %s\\n", state.String())
 		if state == webrtc.ICEConnectionStateFailed || state == webrtc.ICEConnectionStateDisconnected || state == webrtc.ICEConnectionStateClosed {
-			log.Printf("ICE Connection State is %s, WebSocket might close or be closed.", state.String())
+			log.Printf("ICE接続状態が%sのため、WebSocketは閉じるか、閉じられる可能性があります。", state.String())
 		}
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("PeerConnection State has changed: %s\\n", state.String())
+		log.Printf("PeerConnection状態が変更されました: %s\\n", state.String())
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected || state == webrtc.PeerConnectionStateClosed {
-			log.Printf("PeerConnection State is %s, WebSocket might close or be closed.", state.String())
+			log.Printf("PeerConnection状態が%sのため、WebSocketは閉じるか、閉じられる可能性があります。", state.String())
 		}
 	})
 
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		log.Printf("New DataChannel detected: %s - ID: %d\\n", dc.Label(), *dc.ID())
+		log.Printf("新しいDataChannelが検出されました: %s - ID: %d\\n", dc.Label(), *dc.ID())
 
 		if dc.Label() != "videoNaluChannel" {
-			log.Printf("DataChannel %s is not 'videoNaluChannel', ignoring.", dc.Label())
+			log.Printf("DataChannel %s は 'videoNaluChannel' ではないため、無視されます。", dc.Label())
 			return
 		}
 
 		dc.OnOpen(func() {
-			log.Printf("Data channel '%s'-'%d' open. Ready to send video data.\\n", dc.Label(), *dc.ID())
+			log.Printf("DataChannel '%s'-'%d' が開きました。ビデオデータの送信準備ができました。\\n", dc.Label(), *dc.ID())
 			dataChannelMutex.Lock()
 			currentVideoDataChannel = dc
 			dataChannelMutex.Unlock()
 		})
 
-		// Register channel closing handling
+		// チャネルクローズ処理の登録
 		dc.OnClose(func() {
-			log.Printf("Data channel '%s'-'%d' closed.\\n", dc.Label(), *dc.ID())
+			log.Printf("DataChannel '%s'-'%d' が閉じました。\\n", dc.Label(), *dc.ID())
 			dataChannelMutex.Lock()
-			// Clear currentVideoDataChannel if it's this one
+			// currentVideoDataChannelがこのチャネルである場合はクリア
 			if currentVideoDataChannel != nil && currentVideoDataChannel.ID() != nil && dc.ID() != nil &&
 				*currentVideoDataChannel.ID() == *dc.ID() {
 				currentVideoDataChannel = nil
-				log.Printf("currentVideoDataChannel has been set to nil for %s-%d", dc.Label(), *dc.ID())
+				log.Printf("currentVideoDataChannelが%s-%dのためnilに設定されました", dc.Label(), *dc.ID())
 			}
 			dataChannelMutex.Unlock()
 		})
 
 		dc.OnError(func(err error) {
-			log.Printf("Data channel '%s'-'%d' error: %v\\n", dc.Label(), *dc.ID(), err)
+			log.Printf("DataChannel '%s'-'%d' エラー: %v\\n", dc.Label(), *dc.ID(), err)
 		})
 
+		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			// クライアントからのメッセージは想定していません
+			log.Printf("DataChannelからメッセージを受信しました: %s", string(msg.Data))
+		})
 	})
 
 
-	// WebSocket message loop
+	// WebSocketメッセージループ
 	for {
 		_, msg, err := ws.ReadMessage()
 		if err != nil {
-			log.Printf("Error reading message from WebSocket: %v. Closing WebSocket.", err)
+			log.Printf("WebSocketからのメッセージ読み取り中にエラーが発生しました: %v。WebSocketを閉じます。", err)
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
-				log.Printf("WebSocket unexpectedly closed: %v", err)
+				log.Printf("WebSocketが予期せず閉じられました: %v", err)
 			}
 			break
 		}
 		var p map[string]interface{}
 		if err := json.Unmarshal(msg, &p); err != nil {
-			log.Printf("Error unmarshalling message: %v. Message: %s", err, string(msg))
+			log.Printf("メッセージのデシリアライズ中にエラーが発生しました: %v。メッセージ: %s", err, string(msg))
 			continue 
 		}
 
@@ -146,117 +150,114 @@ func signalingHandler(w http.ResponseWriter, r *http.Request) {
 		case "offer":
 			sdp, ok := p["sdp"].(string)
 			if !ok {
-				log.Printf("Invalid offer format: sdp is not a string. Payload: %v", p)
+				log.Printf("無効なオファー形式: sdpが文字列ではありません。ペイロード: %v", p)
 				continue
 			}
-			log.Println("Received offer")
+			log.Println("オファーを受信しました")
 			if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdp}); err != nil {
-				log.Printf("Failed to set remote description (offer): %v", err)
+				log.Printf("リモート記述の設定に失敗しました（オファー）: %v", err)
 				continue
 			}
 			
 			answer, err := pc.CreateAnswer(nil)
 			if err != nil {
-				log.Printf("Failed to create answer: %v", err)
+				log.Printf("アンサーの作成に失敗しました: %v", err)
 				continue
 			}
 			
 			if err := pc.SetLocalDescription(answer); err != nil {
-				log.Printf("Failed to set local description (answer): %v", err)
+				log.Printf("ローカル記述の設定に失敗しました（アンサー）: %v", err)
 				continue
 			}
 			
 			<-webrtc.GatheringCompletePromise(pc)
-			log.Println("ICE Gathering complete. Sending answer.") 
+			log.Println("ICE収集完了。アンサーを送信します。") 
 
 			localDesc := pc.LocalDescription()
 			if localDesc == nil {
-				log.Println("Local description is nil after ICE gathering.")
+				log.Println("ICE収集後にローカル記述がnilです。")
 				continue
 			}
 			
 			resp := map[string]string{"type": "answer", "sdp": localDesc.SDP}
 			b, err := json.Marshal(resp)
 			if err != nil {
-				log.Printf("Error marshalling answer: %v", err)
+				log.Printf("アンサーのシリアライズ中にエラーが発生しました: %v", err)
 				continue
 			}
 			
 			if err := ws.WriteMessage(websocket.TextMessage, b); err != nil {
-				log.Printf("Error writing answer to WebSocket: %v", err)
+				log.Printf("WebSocketへのアンサー書き込み中にエラーが発生しました: %v", err)
 				break 
 			}
 		case "candidate":
 			candidateStr, ok := p["candidate"].(string)
 			if !ok {
-				log.Printf("Invalid candidate format: candidate is not a string. Payload: %v", p)
+				log.Printf("無効な候補形式: candidateが文字列ではありません。ペイロード: %v", p)
 				continue
 			}
-			log.Println("Received ICE candidate") 
+			log.Println("ICE候補を受信しました") 
 			if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidateStr}); err != nil {
-				log.Printf("Failed to add ICE candidate: %v", err)
+				log.Printf("ICE候補の追加に失敗しました: %v", err)
 			}
 		default:
-			log.Printf("Received unknown message type: %s", p["type"])
+			log.Printf("未知のメッセージタイプを受信しました: %s", p["type"])
 		}
 	}
-	log.Println("Exiting signalingHandler.")
+	log.Println("signalingHandlerを終了します。")
 }
 
 func startFFmpeg(rtspURL string) {
-	log.Printf("Starting FFmpeg for RTSP URL: %s", rtspURL)
+	log.Printf("RTSP URLに対してFFmpegを開始します: %s", rtspURL)
 	cmd := exec.Command("ffmpeg",
-		"-hide_banner", // Optional: cleans up FFmpeg startup logs
+		"-hide_banner", // オプション: FFmpeg起動ログをクリーンアップします
 		"-avioflags", "direct",
 		"-flags", "low_delay",
 		"-fflags", "+igndts+nobuffer",
-		"-vsync", "0", // Can also be -vsync passthrough or -vsync cfr/vfr depending on needs
+		"-vsync", "0", // 必要に応じて -vsync passthrough または -vsync cfr/vfr も可
 		"-rtsp_transport", "tcp",
 		"-i", rtspURL,
 		"-tune", "zerolatency",
-		// IMPORTANT: -c:v copy assumes the RTSP source is already H.264 with a profile compatible with client's VideoDecoder (e.g., profile-level-id=42e01f for Constrained Baseline@L3.1).
-		// If the source has a different profile (e.g., Main or High), VideoDecoder might fail.
-		// To force re-encoding to a compatible profile (adds latency and CPU load):
+		// 重要: -c:v copy は、RTSPソースが既にクライアントのVideoDecoderと互換性のあるプロファイル（例: Constrained Baseline@L3.1の場合はprofile-level-id=42e01f）のH.264であることを前提としています。
+		// ソースが異なるプロファイル（例: MainまたはHigh）の場合、VideoDecoderが失敗する可能性があります。
+		// 互換性のあるプロファイルに強制的に再エンコードする場合（遅延とCPU負荷が増加します）:
 		// "-c:v", "libx264", "-profile:v", "baseline", "-level:v", "3.1", "-preset", "ultrafast", "-tune", "zerolatency",
-		// "-pix_fmt", "yuv420p", // Often required for H.264
+		// "-pix_fmt", "yuv420p", // H.264でしばしば必要
 		"-c:v", "copy",
-		"-an", // No audio
-		"-f", "h264", // Output raw H.264 (Annex B format)
-		"pipe:1",     // Output to stdout
+		"-an", // 音声なし
+		"-f", "h264", // 生のH.264（Annex B形式）を出力
+		"pipe:1",     // 標準出力に出力
 	)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Printf("Error creating stdout pipe for FFmpeg: %v", err)
+		log.Printf("FFmpegの標準出力パイプ作成中にエラーが発生しました: %v", err)
 		return
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		log.Printf("Error creating stderr pipe for FFmpeg: %v", err)
+		log.Printf("FFmpegの標準エラーパイプ作成中にエラーが発生しました: %v", err)
 		return
 	}
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("Error starting FFmpeg: %v", err)
+		log.Printf("FFmpegの起動中にエラーが発生しました: %v", err)
 		return
 	}
-	log.Println("FFmpeg process started.")
+	log.Println("FFmpegプロセスが開始されました。")
 
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
+			log.Printf("FFmpeg stderr: %s", scanner.Text())
 		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("Error reading FFmpeg stderr: %v", err)
-		}
-		log.Println("FFmpeg stderr stream finished.")
 	}()
 
-	h264BufReader := bufio.NewReaderSize(stdout, 1024*64) 
+	h264BufReader := bufio.NewReaderSize(stdout, 1024*64) // バッファサイズを大きくする
 	rdr, err := h264reader.NewReader(h264BufReader)
 	if err != nil {
-		log.Printf("Error creating H264 reader: %v", err)
+		log.Printf("H264リーダー作成中にエラーが発生しました: %v", err)
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
@@ -264,14 +265,14 @@ func startFFmpeg(rtspURL string) {
 		return
 	}
 
-	log.Println("Reading H.264 NALUs from FFmpeg...")
+	log.Println("FFmpegからH.264 NALUを読み込んでいます...")
 	for {
 		nal, err := rdr.NextNAL()
 		if err != nil {
 			if err == io.EOF {
-				log.Println("FFmpeg stream ended (EOF).")
+				log.Println("FFmpegストリームが終了しました（EOF）。")
 			} else {
-				log.Printf("Error reading NAL from H264 reader: %v\\n", err)
+				log.Printf("H264リーダーからNAL読み込み中にエラーが発生しました: %v\\n", err)
 			}
 			break 
 		}
@@ -296,7 +297,7 @@ func startFFmpeg(rtspURL string) {
 
 		jsonData, err := json.Marshal(payload)
 		if err != nil {
-			log.Printf("Error marshalling NALU payload: %v", err)
+			log.Printf("NALUペイロードのシリアライズ中にエラーが発生しました: %v", err)
 			continue
 		}
 
@@ -309,22 +310,22 @@ func startFFmpeg(rtspURL string) {
 		
 			err := dc.SendText(string(jsonData))
 			if err != nil {
-				log.Printf("Error writing NALU data to DataChannel (type: %s): %v", naluType, err)
+				log.Printf("DataChannelにNALUデータを書き込む際にエラーが発生しました（タイプ: %s）: %v", naluType, err)
 			}
 		} else {
 			time.Sleep(2 * time.Millisecond)
 		}
 	}
 
-	log.Println("Stopped reading H.264 NALUs.")
+	log.Println("H.264 NALUの読み込みを停止しました。")
 	if cmd.Process != nil {
-		log.Println("Waiting for FFmpeg process to exit...")
+		log.Println("FFmpegプロセスの終了を待っています...")
 		if err := cmd.Wait(); err != nil { 
-			log.Printf("FFmpeg process exited with error: %v", err)
+			log.Printf("FFmpegプロセスがエラーで終了しました: %v", err)
 		} else {
-			log.Println("FFmpeg process exited successfully.")
+			log.Println("FFmpegプロセスが正常に終了しました。")
 		}
 	} else {
-		log.Println("FFmpeg process was not started or already cleaned up.")
+		log.Println("FFmpegプロセスは開始されていないか、既にクリーンアップされています。")
 	}
 }
