@@ -7,223 +7,209 @@
   <script defer>
     document.addEventListener("DOMContentLoaded", () => {
       console.log("DOMContentLoaded event fired.");
-      const wsUrl = `ws://localhost:8080/ws`;
-      const canvas = document.getElementById("remoteCanvas"); 
-      const ctx = canvas.getContext("2d"); 
+      const wsUrl = `ws://localhost:8080/ws?output=webcodecs`; // Ensure output mode is specified if needed by server
+      const canvas = document.getElementById("remoteCanvas");
+      const ctx = canvas.getContext("2d");
       const ws = new WebSocket(wsUrl);
-      let pc;
       let videoDecoder;
-      let videoDataChannel;
+      let spsFromConfig = null;
+      let ppsFromConfig = null;
+
+      // Helper to convert Blob to ArrayBuffer
+      function blobToArrayBuffer(blob) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsArrayBuffer(blob);
+        });
+      }
+
+      // Helper to convert Blob to text
+      function blobToText(blob) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsText(blob);
+        });
+      }
+
+      // 4 byte スタートコードを付けて Annex-B 形式で結合するヘルパー
+      const annexB = (...nalus) => {
+        const sc = new Uint8Array([0, 0, 0, 1]);
+        const totalLength = nalus.reduce((sum, nalu) => sum + (nalu ? nalu.length : 0), 0);
+        const size = nalus.filter(n => n).length * 4 + totalLength;
+        if (size === 0) return new Uint8Array(0);
+
+        const buf  = new Uint8Array(size);
+        let off = 0;
+        for (const n of nalus) {
+          if (n) {
+            buf.set(sc, off); off += 4;
+            buf.set(n, off); off += n.length;
+          }
+        }
+        return buf;
+      };
 
       ws.addEventListener("open", async () => {
-        console.log("WebSocket connection opened.");
-        try {
-          pc = new RTCPeerConnection({
-            iceServers: [
-              // Googleの公開STUNサーバーを使用
-              { urls: "stun:stun.l.google.com:19302" }
-            ], 
-            iceTransportPolicy: 'all',      // UDP 優先
-            bundlePolicy: 'max-bundle',     // 1 つの流路にまとめる
-            rtcpMuxPolicy: 'require'        // RTC 用ポートを共用
+        console.log("WebSocket connection opened for WebCodecs.");
+        // VideoDecoder の初期化
+        if (!videoDecoder) {
+          videoDecoder = new VideoDecoder({
+            output: (videoFrame) => {
+              // console.log("VideoDecoder output:", videoFrame.timestamp);
+              ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height); // Use canvas width/height
+              videoFrame.close();
+            },
+            error: (err) => {
+              console.error("VideoDecoder error:", err);
+            }
           });
-          console.log("RTCPeerConnection created."); 
-
-          // VideoDecoder の初期化
-          if (!videoDecoder) {
-            videoDecoder = new VideoDecoder({
-              output: (videoFrame) => {
-                console.log("VideoDecoder output:", videoFrame); 
-                 if (canvas.width !== videoFrame.displayWidth || canvas.height !== videoFrame.displayHeight) {
-                  canvas.width = videoFrame.displayWidth;
-                  canvas.height = videoFrame.displayHeight;
-                  console.log("Canvas resized to:", canvas.width, "x", canvas.height); 
-                }
-                ctx.drawImage(videoFrame, 0, 0, videoFrame.displayWidth, videoFrame.displayHeight);
-                console.log("Drew frame to canvas:", videoFrame.timestamp); 
-                videoFrame.close(); 
-              },
-              error: (err) => {
-                console.error("VideoDecoder error:", err);
-              }
-            });
-
-            try {
-              videoDecoder.configure({
-                codec: 'avc1.42e01f',
-                optimizeForLatency: true,
-                hardwareAcceleration: 'prefer-hardware'
-              });
-              console.log("VideoDecoder configured successfully.");
-            } catch (err) {
-              console.error("Failed to configure VideoDecoder:", err);
-            }
-          }
-
-          videoDataChannel = pc.createDataChannel("videoNaluChannel", { ordered: false, maxRetransmits: 0,priority: 'high'  });
-          console.log("videoDataChannel created:", videoDataChannel);
-
-          videoDataChannel.onopen = () => {
-            console.log("videoDataChannel 'videoNaluChannel' opened");
-          };
-
-          videoDataChannel.onclose = () => {
-            console.log("videoDataChannel 'videoNaluChannel' closed");
-          };
-
-          videoDataChannel.onerror = (error) => {
-            console.error("videoDataChannel 'videoNaluChannel' error:", error);
-          };
-
-          let pendingSPS, pendingPPS;
-
-          let spsNal = null;
-          let ppsNal = null;
-
-          videoDataChannel.onmessage = ({ data }) => {
-            if (typeof data !== 'string') return; 
-            const msg = JSON.parse(data);
-            const nalu = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
-
-            // 4 byte スタートコードを付けて Annex-B 形式で結合するヘルパー
-            const annexB = (...nalus) => {
-              const sc = new Uint8Array([0, 0, 0, 1]);
-              const size = nalus.reduce((s, n) => s + 4 + n.length, 0);
-              const buf  = new Uint8Array(size);
-              let off = 0;
-              for (const n of nalus) { buf.set(sc, off); off += 4; buf.set(n, off); off += n.length; }
-              return buf;
-            };
-
-            switch (msg.type) {
-              case 'sps':
-                spsNal = nalu;
-                return;
-              case 'pps':
-                ppsNal = nalu;
-                return;
-              case 'key': {
-                if (!spsNal || !ppsNal) {
-                  console.warn('SPS/PPS 未受信のままキーを受け取りました。スキップします');
-                  return;
-                }
-
-                if (videoDecoder.state !== 'configured') {
-                  videoDecoder.configure({
-                    codec: 'avc1.42e01f',
-                    optimizeForLatency: true,
-                    hardwareAcceleration: 'prefer-hardware'
-                  });
-                }
-
-                const au = annexB(spsNal, ppsNal, nalu);
-                videoDecoder.decode(new EncodedVideoChunk({
-                  type: 'key',
-                  timestamp: msg.timestamp * 1000,
-                  data: au,
-                }));
-                break;
-              }
-              case 'delta': {
-                if (videoDecoder.state !== 'configured') return;
-                videoDecoder.decode(new EncodedVideoChunk({
-                  type: 'delta',
-                  timestamp: msg.timestamp * 1000,
-                  data: annexB(nalu),
-                }));
-                break;
-              }
-            }
-          };
-
-          pc.onicecandidateerror = (event) => {
-            console.error("ICE candidate error event:", event);
-            if (event.url && event.errorCode && event.errorText) {
-              console.error(`ICE Candidate Error: URL=${event.url}, Code=${event.errorCode}, Text=${event.errorText}`);
-            }
-          };
-
-          pc.oniceconnectionstatechange = (event) => {
-            console.log(`ICE connection state changed: ${pc.iceConnectionState}`, event);
-          };
-
-          pc.ontrack = (e) => {
-            console.log("pc.ontrack event:", e); 
-            if (e.track.kind === 'audio') {
-              console.log("Received audio track:", e.track);
-            }
-          };
-
-          // ICE候補が見つかったらサーバーに送信
-          pc.onicecandidate = ({ candidate }) => {
-            if (candidate) {
-              console.log("Sending ICE candidate:", candidate.candidate); 
-              ws.send(JSON.stringify({ type: "candidate", candidate: candidate.candidate }));
-            } else {
-              console.log("All ICE candidates have been gathered and sent.");
-            }
-          };
-
-          console.log("Creating offer...");
-          const offer = await pc.createOffer({ offerToReceiveVideo: true }); 
-          console.log("Offer created:", offer);         
-          console.log("Setting local description with offer...");
-          try {
-            await pc.setLocalDescription(offer);
-            console.log("Local description set successfully.");
-            console.log("pc.localDescription after setLocalDescription:", pc.localDescription); 
-            
-            // オファーをサーバーに送信
-            if (pc.localDescription && pc.localDescription.sdp) {
-              console.log("▶️ pc.localDescription (final for offer):", pc.localDescription);
-              console.log("▶️ pc.localDescription.sdp (final for offer):", pc.localDescription.sdp);
-              const offerPayload = { type: "offer", sdp: pc.localDescription.sdp };
-              const offerPayloadString = JSON.stringify(offerPayload);
-              console.log("▶️ Offer payload to send (string):", offerPayloadString);
-              
-              if (offerPayloadString && offerPayloadString !== "{}") { 
-                ws.send(offerPayloadString);
-                console.log("Offer sent to server."); 
-              } else {
-                console.error("Offer payload string is empty or invalid. Not sending. Payload:", offerPayloadString);
-              }
-            } else {
-               console.error("Local description or SDP is missing after setLocalDescription. Cannot send offer.");
-            }
-
-          } catch (err) {
-            console.error("Error setting local description or sending offer:", err);
-          }
-
-        } catch (error) {
-          console.error("Error in WebSocket 'open' handler:", error); 
+          console.log("VideoDecoder initialized.");
+          // Configuration will happen upon receiving SPS/PPS or can be generic if SPS/PPS are prepended
         }
       });
 
       ws.addEventListener("message", async ({ data }) => {
-        console.log("Raw message data from server:", data); 
+        // console.log("Raw message data from server:", data);
         try {
-          const msg = JSON.parse(data);
-          console.log("◀️ Message from server (parsed):", msg); 
-          if (msg.type === "answer") {
-            console.log("✔️ Answer SDP:", msg.sdp);
-            if (!msg.sdp) {
-                console.error("Answer SDP is missing or empty.");
+          if (data instanceof Blob) {
+            let msgText;
+            try {
+              msgText = await blobToText(data);
+              const msg = JSON.parse(msgText);
+              // console.log("◀️ Message from server (parsed from Blob as JSON):", msg);
+
+              if (msg.type === "codec" && msg.sps && msg.pps) {
+                console.log("Received codec configuration:", msg);
+                spsFromConfig = Uint8Array.from(atob(msg.sps), c => c.charCodeAt(0));
+                ppsFromConfig = Uint8Array.from(atob(msg.pps), c => c.charCodeAt(0));
+
+                if (videoDecoder.state !== "configured") {
+                  try {
+                    videoDecoder.configure({
+                      codec: 'avc1.42e01f', // This might need to be dynamic based on SPS
+                      // description: annexB(spsFromConfig, ppsFromConfig), // Alternative: provide SPS/PPS here
+                      optimizeForLatency: true,
+                      hardwareAcceleration: 'prefer-hardware'
+                    });
+                    console.log("VideoDecoder configured successfully.");
+                  } catch (err) {
+                    console.error("Failed to configure VideoDecoder:", err);
+                  }
+                } else {
+                   console.log("VideoDecoder already configured. SPS/PPS received.");
+                }
                 return;
+              } else if (msg.type === "video" && typeof msg.data === 'string') {
+                // console.log("Received video data (JSON):", msg);
+                
+                // msg.data is base64 encoded AnnexB NALU from server: [0,0,0,1, RAW_NALU_HEADER, RAW_NALU_PAYLOAD...]
+                const receivedAnnexBFrame = Uint8Array.from(atob(msg.data), c => c.charCodeAt(0));
+
+                if (!spsFromConfig || !ppsFromConfig) {
+                  console.warn("Received video NALU (JSON) but SPS/PPS not yet available. Skipping.");
+                  return;
+                }
+                if (videoDecoder.state !== 'configured') {
+                  console.warn("VideoDecoder not configured. Skipping video NALU (JSON).");
+                  return;
+                }
+
+                if (receivedAnnexBFrame.length < 5) { // Minimum 4-byte start code + 1-byte NALU header
+                    console.warn("Received video data is too short to contain a NALU header.");
+                    return;
+                }
+
+                // The actual NALU header is after the 4-byte start code (0x00000001)
+                const rawNaluHeaderByte = receivedAnnexBFrame[4]; 
+                const naluType = rawNaluHeaderByte & 0x1F;
+                let chunkType = 'delta';
+                let chunkData;
+
+                if (naluType === 5) { // IDR slice (key frame)
+                  chunkType = 'key';
+                  // For EncodedVideoChunk, key frames often need SPS and PPS prepended.
+                  // spsFromConfig and ppsFromConfig are raw NALUs.
+                  // receivedAnnexBFrame.slice(4) gives the raw IDR NALU (without the start code server added for this message).
+                  chunkData = annexB(spsFromConfig, ppsFromConfig, receivedAnnexBFrame.slice(4));
+                  // console.log(`Decoding key frame (IDR, type ${naluType}) from JSON. Header byte: 0x${rawNaluHeaderByte.toString(16)}`);
+                } else if (naluType === 1) { // Non-IDR slice (P-frame typically)
+                   chunkType = 'delta';
+                   // For non-IDR frames, the EncodedVideoChunk data is the frame itself (already in Annex B format from server).
+                   chunkData = receivedAnnexBFrame;
+                   // console.log(`Decoding delta frame (type ${naluType}) from JSON. Header byte: 0x${rawNaluHeaderByte.toString(16)}`);
+                } else {
+                  // Server should only send NALU types 1 or 5 in "video" messages due to its filter.
+                  console.warn(`Received unexpected NALU type ${naluType} (Raw Header: 0x${rawNaluHeaderByte.toString(16)}) in 'video' message. Server should have filtered this. Skipping.`);
+                  return;
+                }
+                
+                if (chunkData && chunkData.length > 0) {
+                  const chunk = new EncodedVideoChunk({
+                    type: chunkType,
+                    timestamp: videoDecoder.decodeQueueSize, // Using queue size as a simple timestamp
+                    duration: msg.duration, // Duration from server (microseconds)
+                    data: chunkData
+                  });
+                  videoDecoder.decode(chunk);
+                }
+                return; 
+              }
+              // If not codec and not video, then it's unexpected JSON
+              console.warn("Received unexpected JSON message from Blob:", msg);
+
+            } catch (e) {
+              // console.log("Received Blob, not JSON, assuming NALU data.");
+              const arrayBufferData = await blobToArrayBuffer(data);
+              const nalu = new Uint8Array(arrayBufferData);
+
+              if (!spsFromConfig || !ppsFromConfig) {
+                console.warn("Received NALU data but SPS/PPS not yet available. Skipping.");
+                return;
+              }
+              if (videoDecoder.state !== 'configured') {
+                console.warn("VideoDecoder not configured. Skipping NALU.");
+                return;
+              }
+
+              const naluType = nalu[0] & 0x1F;
+              let chunkType = 'delta';
+              let chunkData;
+
+              if (naluType === 5) { // IDR slice (key frame)
+                chunkType = 'key';
+                chunkData = annexB(spsFromConfig, ppsFromConfig, nalu);
+                // console.log("Decoding key frame (IDR)");
+              } else if (naluType === 7 || naluType === 8) { // SPS or PPS
+                console.log(`Received SPS/PPS (type ${naluType}) in NALU stream, re-configuring or ignoring.`);
+                // Potentially update spsFromConfig/ppsFromConfig and reconfigure decoder if needed
+                // For now, we assume initial config is enough or key frames carry them.
+                return;
+              } else if (naluType >= 1 && naluType <= 23 && naluType !== 5 && naluType !== 7 && naluType !== 8) { // Other video NALUs
+                 chunkData = annexB(nalu);
+                 // console.log(`Decoding delta frame (NALU type ${naluType})`);
+              } else {
+                console.warn(`Received non-video NALU type ${naluType}, skipping.`);
+                return;
+              }
+              
+              if (chunkData && chunkData.length > 0) {
+                videoDecoder.decode(new EncodedVideoChunk({
+                  type: chunkType,
+                  timestamp: videoDecoder.decodeQueueSize, // Using queue size as a simple timestamp, replace with actual
+                  // duration: 0, // Optional: provide duration if known
+                  data: chunkData
+                }));
+              }
             }
-            await pc.setRemoteDescription(
-              new RTCSessionDescription({ type: "answer", sdp: msg.sdp })
-            );
-            console.log("Remote description (answer) set."); 
-          } else if (msg.type === "candidate") {
-            console.log("Received ICE candidate from server:", msg.candidate); 
-            if (msg.candidate) { 
-                await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); // Assuming msg.candidate is a valid RTCIceCandidateInit
-            } else {
-                console.warn("Received null or empty candidate from server.");
-            }
+          } else if (typeof data === 'string') {
+            console.log("Received string data from server (unexpected in pure WebCodecs mode):", data);
+            // Potentially handle JSON-formatted error messages from server if any
           } else {
-            console.warn("Received unknown message type from server:", msg.type);
+            console.warn("Received message of unknown type:", typeof data, data);
           }
         } catch (error) {
           console.error("Error processing message from server:", error, "Raw data:", data);
@@ -231,11 +217,15 @@
       });
 
       ws.addEventListener("error", (event) => {
-        console.error("WebSocket error observed:", event); 
+        console.error("WebSocket error observed:", event);
       });
 
       ws.addEventListener("close", (event) => {
-        console.log("WebSocket connection closed. Code:", event.code, "Reason:", event.reason, "wasClean:", event.wasClean); 
+        console.log("WebSocket connection closed. Code:", event.code, "Reason:", event.reason, "wasClean:", event.wasClean);
+        if (videoDecoder && videoDecoder.state === "configured") {
+          videoDecoder.close();
+          console.log("VideoDecoder closed.");
+        }
       });
     });
   </script>
@@ -249,6 +239,6 @@
   </style>
 </head>
 <body>
-  <canvas id="remoteCanvas"></canvas>
+  <canvas id="remoteCanvas" width="640" height="480"></canvas> <!-- Set initial canvas size -->
 </body>
 </html>

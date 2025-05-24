@@ -23,7 +23,7 @@ func startFFmpegH264RTSP(inputURL string) {
 		"-flags", "low_delay", "-fflags", "+igndts+nobuffer",
 		"-i", inputURL,
 		"-c:v", "copy", "-an", "-fps_mode", "passthrough",
-		"-bsf:v", "h264_metadata=aud=insert", "-flush_packets", "1",
+		"-flush_packets", "1",
 		"-f", "h264", "pipe:1",
 	)
 	stdout, _ := cmd.StdoutPipe()
@@ -45,7 +45,7 @@ func startFFmpegH264RTP(inputURL string) {
 		[]string{}, // preInputArgs
 		[]string{ // postInputArgs
 			"-c:v", "copy", "-an", "-fps_mode", "passthrough",
-			"-bsf:v", "h264_metadata=aud=insert", "-flush_packets", "1",
+			"-flush_packets", "1",
 			"-f", "h264", "pipe:1",
 		})
 	if err != nil {
@@ -100,7 +100,7 @@ func startFFmpegH265ToH264NALGPURTSP(inputURL string) {
 		"-i", inputURL, "-an",
 		"-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-delay", "0",
 		"-rc:v", "cbr", "-b:v", "6M", "-g", "30", "-bf", "0",
-		"-fps_mode", "passthrough", "-bsf:v", "h264_metadata=aud=insert",
+		"-fps_mode", "passthrough",
 		"-map", "0:v:0", "-f", "h264", "pipe:1",
 	)
 	stdout, _ := cmd.StdoutPipe()
@@ -127,7 +127,7 @@ func startFFmpegH265ToH264NALGPURTP(inputURL string) {
 			"-an",
 			"-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-delay", "0",
 			"-rc:v", "cbr", "-b:v", "6M", "-g", "30", "-bf", "0",
-			"-fps_mode", "passthrough", "-bsf:v", "h264_metadata=aud=insert",
+			"-fps_mode", "passthrough",
 			"-map", "0:v:0", "-f", "h264", "pipe:1",
 		})
 	if err != nil {
@@ -202,9 +202,6 @@ func startFFmpegH265ToH264NALCPURTSP(inputURL string) {
 
 		// フレームレートとメタデータ
 		"-fps_mode", "passthrough", // 入力フレームレートを維持
-		"-bsf:v", "h264_metadata=aud=insert",
-
-		// 出力
 		"-map", "0:v:0",
 		"-f", "h264",
 		"pipe:1",
@@ -240,7 +237,6 @@ func startFFmpegH265ToH264NALCPURTP(inputURL string) {
 			"-g", "30",
 			"-bf", "0",
 			"-fps_mode", "passthrough",
-			"-bsf:v", "h264_metadata=aud=insert",
 			"-map", "0:v:0",
 			"-f", "h264",
 			"pipe:1",

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/base64"
+	"bytes" // 追加
 	"encoding/json"
 	"log"
 	"net/http"
@@ -51,15 +51,16 @@ func signalingHandler(w http.ResponseWriter, r *http.Request, outputMode string)
 		// 既存のSPS/PPSがあれば送信
 		webcodecClientsMutex.RLock()
 		sent := codecConfigSentToWebcodecClients[ws]
-		currentSpsNAL := spsNAL // RLock中にアクセス
-		currentPpsNAL := ppsNAL // RLock中にアクセス
+		// グローバルな spsNAL と ppsNAL を直接参照
+		currentSps := spsNAL
+		currentPps := ppsNAL
 		webcodecClientsMutex.RUnlock()
 
-		if !sent && currentSpsNAL != nil && currentPpsNAL != nil {
+		if !sent && currentSps != nil && currentPps != nil {
 			config := map[string]interface{}{
 				"type": "codec",
-				"sps":  base64.StdEncoding.EncodeToString(currentSpsNAL), // base64エンコードは必要
-				"pps":  base64.StdEncoding.EncodeToString(currentPpsNAL),
+				"sps":  currentSps,
+				"pps":  currentPps,
 			}
 			configMessage, _ := json.Marshal(config)
 			if err := ws.WriteMessage(websocket.BinaryMessage, configMessage); err != nil {
@@ -247,14 +248,48 @@ func writeNALsToTracks(nals [][]byte, duration time.Duration) {
 		}
 	}
 
+	// グローバルなSPS/PPSを更新する試み
+	// この処理は sendNALsToWebCodecClients の前に実行して、
+	// sendNALsToWebCodecClients が最新のSPS/PPSを参照できるようにする
+	var newSps, newPps []byte
+	for _, nalData := range nals {
+		if len(nalData) > 0 {
+			nalType := nalData[0] & 0x1F
+			if nalType == 7 { // SPS
+				newSps = nalData
+			} else if nalType == 8 { // PPS
+				newPps = nalData
+			}
+		}
+	}
+
+	if newSps != nil || newPps != nil {
+		webcodecClientsMutex.Lock()
+		if newSps != nil {
+			if len(spsNAL) == 0 || !bytes.Equal(spsNAL, newSps) {
+				spsNAL = make([]byte, len(newSps))
+				copy(spsNAL, newSps)
+				log.Println("SPSを保存/更新しました (from writeNALsToTracks)")
+			}
+		}
+		if newPps != nil {
+			if len(ppsNAL) == 0 || !bytes.Equal(ppsNAL, newPps) {
+				ppsNAL = make([]byte, len(newPps))
+				copy(ppsNAL, newPps)
+				log.Println("PPSを保存/更新しました (from writeNALsToTracks)")
+			}
+		}
+		webcodecClientsMutex.Unlock()
+	}
+
 	// WebCodecsクライアントへの送信
 	sendNALsToWebCodecClients(nals, duration)
 }
 
 // --- NALストリーミングループ (ffmpegベースのハンドラー用) ---
-func streamNAL(h264r *h264reader.H264Reader, dur time.Duration) { // インターフェースを *h264reader.H264Reader に変更
+func streamNAL(h264r *h264reader.H264Reader, dur time.Duration) {
 	for {
-		nal, err := h264r.NextNAL() // nal は *h264reader.NAL になりました
+		nal, err := h264r.NextNAL()
 		if err != nil {
 			if err.Error() != "EOF" { // io.EOF から文字列比較に変更し、より広範な互換性を確保
 				log.Printf("H264リーダーからのNAL読み取りエラー: %v", err)
@@ -264,19 +299,23 @@ func streamNAL(h264r *h264reader.H264Reader, dur time.Duration) { // インタ�
 
 		// SPS と PPS をグローバル変数に保存 (初回のみ)
 		nalType := nal.Data[0] & 0x1F
-		webcodecClientsMutex.Lock() // SPS/PPSの更新と読み取りのためにロック
-		if nalType == 7 && spsNAL == nil { // SPS
-			spsNAL = make([]byte, len(nal.Data))
-			copy(spsNAL, nal.Data)
-			log.Println("SPSを保存しました")
-		} else if nalType == 8 && ppsNAL == nil { // PPS
-			ppsNAL = make([]byte, len(nal.Data))
-			copy(ppsNAL, nal.Data)
-			log.Println("PPSを保存しました")
+		webcodecClientsMutex.Lock()
+		// グローバル変数を更新
+		if nalType == 7 { // SPS
+			if len(spsNAL) == 0 || !bytes.Equal(spsNAL, nal.Data) { // 変更があった場合のみ更新
+				spsNAL = make([]byte, len(nal.Data))
+				copy(spsNAL, nal.Data)
+				log.Println("SPSを保存/更新しました")
+			}
+		} else if nalType == 8 { // PPS
+			if len(ppsNAL) == 0 || !bytes.Equal(ppsNAL, nal.Data) { // 変更があった場合のみ更新
+				ppsNAL = make([]byte, len(nal.Data))
+				copy(ppsNAL, nal.Data)
+				log.Println("PPSを保存/更新しました")
+			}
 		}
 		webcodecClientsMutex.Unlock()
 
-		// WebRTCクライアントへの送信
 		sample := media.Sample{
 			Data:     append([]byte{0x00, 0x00, 0x00, 0x01}, nal.Data...), // Annex-B
 			Duration: dur,
@@ -298,77 +337,132 @@ func streamNAL(h264r *h264reader.H264Reader, dur time.Duration) { // インタ�
 
 // sendNALsToWebCodecClients は、NALユニットを接続されているすべてのWebCodecsクライアントに送信します。
 func sendNALsToWebCodecClients(nals [][]byte, duration time.Duration) {
-	webcodecClientsMutex.RLock()
-	// SPS/PPSがまだ送信されていないクライアントがいるか確認し、必要なら送信
-	for wsClient, sentConfig := range codecConfigSentToWebcodecClients {
-		if !sentConfig && spsNAL != nil && ppsNAL != nil {
-			// RLock内で送信処理を行うとデッドロックの可能性があるため、
-			// 送信が必要なクライアントを特定し、後でまとめて送信するか、
-			// ロックの粒度を調整する必要がある。
-			// ここでは、まず設定を送信する。
-			config := map[string]interface{}{
-				"type": "codec",
-				"sps":  spsNAL, // グローバル変数を直接使用
-				"pps":  ppsNAL,
-			}
-			configMessage, err := json.Marshal(config)
-			if err != nil {
-				log.Printf("コーデック設定のJSONマーシャリングエラー: %v", err)
-				continue
-			}
-			// 送信処理はRLockの外で行うべきだが、ここでは簡略化のためRLock内で行う。
-			// ただし、WriteMessageがブロックする可能性があるため注意が必要。
-			// 実際には、送信が必要なクライアントのリストを作成し、RLockを解放してから送信する。
-			if err := wsClient.WriteMessage(websocket.BinaryMessage, configMessage); err != nil {
-				log.Printf("WebCodecsクライアントへのコーデック設定送信エラー: %v", err)
-			} else {
-				log.Printf("SPS/PPSをWebCodecsクライアント %s に送信しました", wsClient.RemoteAddr())
-				// この更新は書き込みロックが必要
-				// codecConfigSentToWebcodecClients[wsClient] = true // RLock内では不可
-			}
-		}
-	}
-	webcodecClientsMutex.RUnlock() // SPS/PPS送信のためのRLockを解放
+	clientsToSendConfig := make([]*websocket.Conn, 0)
+	var currentGlobalSps, currentGlobalPps []byte // 送信に使用するSPS/PPSを一時的に保持
 
-	// SPS/PPS送信状態を更新 (書き込みロックを取得して行う)
-	webcodecClientsMutex.Lock()
-	for wsClient := range webcodecClients { // webcodecClientsのキーでループ
-		if !codecConfigSentToWebcodecClients[wsClient] && spsNAL != nil && ppsNAL != nil {
-			// 再度送信試行はしない。上記で送信試行済み。
-			// ここでは送信済みフラグを立てるだけ。
-			codecConfigSentToWebcodecClients[wsClient] = true
+	webcodecClientsMutex.RLock()
+	// RLock中にグローバル変数のSPS/PPSをコピー
+	if spsNAL != nil {
+		currentGlobalSps = make([]byte, len(spsNAL))
+		copy(currentGlobalSps, spsNAL)
+	}
+	if ppsNAL != nil {
+		currentGlobalPps = make([]byte, len(ppsNAL))
+		copy(currentGlobalPps, ppsNAL)
+	}
+
+	for wsClient, sentConfig := range codecConfigSentToWebcodecClients {
+		// グローバルなSPS/PPSが利用可能で、まだこのクライアントに送信していなければリストに追加
+		if !sentConfig && currentGlobalSps != nil && currentGlobalPps != nil {
+			clientsToSendConfig = append(clientsToSendConfig, wsClient)
 		}
 	}
-	webcodecClientsMutex.Unlock()
+	webcodecClientsMutex.RUnlock()
+
+	// SPS/PPSを送信 (RLockの外で)
+	if len(clientsToSendConfig) > 0 && currentGlobalSps != nil && currentGlobalPps != nil {
+		config := map[string]interface{}{
+			"type": "codec",
+			"sps":  currentGlobalSps,
+			"pps":  currentGlobalPps,
+		}
+		configMessage, err := json.Marshal(config)
+		if err != nil {
+			log.Printf("コーデック設定のJSONマーシャリングエラー: %v", err)
+		} else {
+			for _, wsClient := range clientsToSendConfig {
+				if err := wsClient.WriteMessage(websocket.BinaryMessage, configMessage); err != nil {
+					log.Printf("WebCodecsクライアント %s へのコーデック設定送信エラー: %v. クライアントを削除します。", wsClient.RemoteAddr(), err)
+					webcodecClientsMutex.Lock()
+					delete(webcodecClients, wsClient)
+					delete(codecConfigSentToWebcodecClients, wsClient)
+					webcodecClientsMutex.Unlock()
+					wsClient.Close()
+				} else {
+					log.Printf("SPS/PPSをWebCodecsクライアント %s に送信しました", wsClient.RemoteAddr())
+					webcodecClientsMutex.Lock()
+					codecConfigSentToWebcodecClients[wsClient] = true
+					webcodecClientsMutex.Unlock()
+				}
+			}
+		}
+	}
 
 	// 実際のビデオNALユニットを送信
-	webcodecClientsMutex.RLock()
-	defer webcodecClientsMutex.RUnlock()
+	if len(nals) == 0 {
+		return
+	}
 
-	if len(webcodecClients) == 0 {
+	clientsToSendData := make([]*websocket.Conn, 0)
+	webcodecClientsMutex.RLock()
+	for client, sentConfig := range codecConfigSentToWebcodecClients {
+		// SPS/PPSが送信済みのクライアントにのみビデオデータを送る
+		if sentConfig {
+			// webcodecClientsマップに存在するか確認（既に閉じられて削除された可能性があるため）
+			if _, ok := webcodecClients[client]; ok {
+				clientsToSendData = append(clientsToSendData, client)
+			}
+		}
+	}
+	webcodecClientsMutex.RUnlock()
+
+	if len(clientsToSendData) == 0 {
 		return
 	}
 
 	for _, nalData := range nals {
 		if len(nalData) == 0 {
+			log.Println("WebCodecs: Skipping empty nalData")
 			continue
 		}
-		message := map[string]interface{}{
-			"type":     "video",
-			"data":     nalData, // バイナリデータのまま
-			"duration": duration.Microseconds(), // マイクロ秒単位の期間
+
+		// Determine NALU type from the raw NAL data (nalData[0])
+		// This is the NALU *before* the Annex B start code is prepended.
+		naluHeaderByte := nalData[0]
+		naluType := naluHeaderByte & 0x1F // Lower 5 bits
+
+		// Filter for decodable NALU types for video frames.
+		// SPS (7) and PPS (8) are handled by the 'codec' message.
+		// We should only send video slice data (type 1 or 5) here.
+		if naluType != 1 && naluType != 5 {
+			// log.Printf("WebCodecs: Skipping NAL type %d (Header Byte: 0x%02x) for video data message", naluType, naluHeaderByte)
+			continue // Skip NALUs that are not video slices
 		}
-		videoMessage, err := json.Marshal(message)
+
+		// Log details about the NALU being sent
+		// log.Printf("WebCodecs: Sending NAL. Original Length: %d, Type: %d (Header Byte: 0x%02x)", len(nalData), naluType, naluHeaderByte)
+
+		// Annex-Bスタートコードを付加
+		annexBData := append([]byte{0x00, 0x00, 0x00, 0x01}, nalData...)
+
+		videoDataMsg := map[string]interface{}{
+			"type":     "video",
+			"data":     annexBData, // Annex B 形式のデータ (JSONでBase64エンコードされる)
+			"duration": duration.Microseconds(), // EncodedVideoChunkのdurationはマイクロ秒
+		}
+		message, err := json.Marshal(videoDataMsg)
 		if err != nil {
 			log.Printf("ビデオデータのJSONマーシャリングエラー: %v", err)
 			continue
 		}
 
-		for wsClient, sentConfig := range codecConfigSentToWebcodecClients {
-			// SPS/PPSが送信済みのクライアントにのみビデオデータを送信
-			if sentConfig {
-				if err := wsClient.WriteMessage(websocket.BinaryMessage, videoMessage); err != nil {
-					// log.Printf("WebCodecsクライアントへのビデオNAL送信エラー: %v", err)
+		for _, wsClient := range clientsToSendData {
+			// log.Printf("WebCodecsクライアント %s にAnnex B NALを送信中 (サイズ: %d)", wsClient.RemoteAddr(), len(annexBData))
+			if err := wsClient.WriteMessage(websocket.BinaryMessage, message); err != nil {
+				// log.Printf("WebCodecsクライアント %s へのNAL送信エラー: %v。クライアントを削除します。", wsClient.RemoteAddr(), err)
+				// エラーが発生したクライアントは能動的に切断・削除する
+				// このクライアントがclientsToSendDataに含まれている場合のみ処理
+				isStillClient := false
+				webcodecClientsMutex.RLock()
+				_, isStillClient = webcodecClients[wsClient]
+				webcodecClientsMutex.RUnlock()
+
+				if isStillClient {
+					webcodecClientsMutex.Lock()
+					delete(webcodecClients, wsClient)
+					delete(codecConfigSentToWebcodecClients, wsClient)
+					webcodecClientsMutex.Unlock()
+					wsClient.Close() // エラー発生時は接続を閉じる
 				}
 			}
 		}
