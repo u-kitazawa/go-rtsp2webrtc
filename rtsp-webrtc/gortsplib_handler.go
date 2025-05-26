@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio" // 追加
-	"io"    // 追加
 	"log"
 	"net/url"
 	"os/exec" // 追加
@@ -185,220 +183,230 @@ func startGortsplibH264RTSP(props props) {
 
 // --- H.265 RTSP -> H.264 WebRTC (gortsplib + ffmpeg) ---
 func startGortsplibH265toH264RTSP(props props) {
-	log.Println("gortsplib: H.265 to H.264 トランスコーディングを開始します")
+    log.Println("gortsplib: H.265 to H.264 並列トランスコーディングを開始します")
 
-	c := gortsplib.Client{
-		OnResponse: func(res *base.Response) {
-			if res.StatusCode == base.StatusOK {
-				sanitizeContentBase(res)
-			}
-		},
-	}
+    c := gortsplib.Client{
+        OnResponse: func(res *base.Response) {
+            if res.StatusCode == base.StatusOK {
+                sanitizeContentBase(res)
+            }
+        },
+    }
 
-	u, err := base.ParseURL(props.inputURL)
-	if err != nil {
-		log.Printf("gortsplib: 入力URLの解析エラー: %v", err)
-		return
-	}
+    u, err := base.ParseURL(props.inputURL)
+    if err != nil {
+        log.Printf("gortsplib: 入力URLの解析エラー: %v", err)
+        return
+    }
 
-	err = c.Start(u.Scheme, u.Host)
-	if err != nil {
-		log.Printf("gortsplib: RTSPサーバーへの接続エラー: %v", err)
-		return
-	}
-	defer c.Close()
+    err = c.Start(u.Scheme, u.Host)
+    if err != nil {
+        log.Printf("gortsplib: RTSPサーバーへの接続エラー: %v", err)
+        return
+    }
+    defer c.Close()
 
-	desc, _, err := c.Describe(u)
-	if err != nil {
-		log.Printf("gortsplib: RTSPストリームの記述エラー: %v", err)
-		return
-	}
+    desc, _, err := c.Describe(u)
+    if err != nil {
+        log.Printf("gortsplib: RTSPストリームの記述エラー: %v", err)
+        return
+    }
 
-	var formaH265 *format.H265
-	medi := desc.FindFormat(&formaH265)
-	if medi == nil {
-		log.Println("gortsplib: H.265メディアが見つかりません")
-		return
-	}
-	log.Println("gortsplib: H.265メディアが見つかりました")
+    var formaH265 *format.H265
+    medi := desc.FindFormat(&formaH265)
+    if medi == nil {
+        log.Println("gortsplib: H.265メディアが見つかりません")
+        return
+    }
 
-	rtpDec, err := formaH265.CreateDecoder()
-	if err != nil {
-		log.Printf("gortsplib: H.265 RTPデコーダーの作成エラー: %v", err)
-		return
-	}
+    rtpDec, err := formaH265.CreateDecoder()
+    if err != nil {
+        log.Printf("gortsplib: H.265 RTPデコーダーの作成エラー: %v", err)
+        return
+    }
 
-	// ffmpeg プロセスの準備
-	// TODO: props.processor に応じてコマンドを切り替える (現在はCPUのみ libx264)
-	ffmpegCmd := "ffmpeg"
-	ffmpegArgs := []string{
-		"-hide_banner",
-		"-loglevel", "error", 
-		"-f", "hevc", 
-		"-i", "pipe:0", 
-		"-c:v", "libx264", 
-		"-preset", "ultrafast", 
-		"-tune", "zerolatency", 
-		"-bsf:v", "h264_mp4toannexb", 
-		"-f", "h264", 
-		"pipe:1", 
-	}
-	if props.processor == "gpu" {
-		// GPU用のffmpeg設定 (例: NVIDIA NVENC) - 環境に合わせて調整が必要
-		// これはあくまで一例であり、実際の環境やffmpegのビルドによって異なります。
-		log.Println("gortsplib: GPU (NVENC) を使用したH.265 -> H.264 トランスコーディングを試みます (ffmpeg設定は環境依存)")
-		ffmpegArgs = []string{
-			"-hide_banner",
-			"-loglevel", "error",
-			"-hwaccel", "auto", // 自動でHWアクセラレーションを試みる
-			"-c:v", "hevc_cuvid", // NVIDIA GPU用デコーダー (環境により異なる)
-			"-i", "pipe:0",
-			"-c:v", "h264_nvenc", // NVIDIA GPU用エンコーダー
-			"-preset", "p1", // NVENCのプリセット (ultrafast相当)
-			"-tune", "ll",    // 低遅延チューニング
-			"-bsf:v", "h264_mp4toannexb",
-			"-f", "h264",
-			"pipe:1",
-		}
-	}
+    // 並列処理用のチャネル（バッファサイズを調整して遅延を最小化）
+    nalChan := make(chan []byte, 5) // 小さなバッファで遅延最小化
+    h264NALChan := make(chan []byte, 5)
+    
+    // FFmpeg設定（さらに最適化）
+    ffmpegArgs := []string{
+        "-hide_banner",
+        "-loglevel", "panic", // ログを最小化
+        "-f", "hevc",
+        "-fflags", "+genpts+igndts+nobuffer",
+        "-probesize", "512",
+        "-analyzeduration", "0",
+        "-i", "pipe:0",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-x264-params", "nal-hrd=cbr:force-cfr=1:sync-lookahead=0:sliced-threads=1:rc-lookahead=0:bframes=0:keyint=10:refs=1",
+        "-b:v", "2M", // ビットレート削減
+        "-maxrate", "2M",
+        "-bufsize", "200k",
+        "-g", "10", // GOP短縮
+        "-bf", "0",
+        "-refs", "1",
+        "-flush_packets", "1",
+        "-real_time", "1",
+        "-bsf:v", "h264_mp4toannexb",
+        "-f", "h264",
+        "pipe:1",
+    }
 
+    if props.processor == "gpu" {
+        ffmpegArgs = []string{
+            "-hide_banner",
+            "-loglevel", "panic",
+            "-hwaccel", "auto",
+            "-c:v", "hevc_cuvid",
+            "-i", "pipe:0",
+            "-c:v", "h264_nvenc",
+            "-preset", "p1",
+            "-tune", "ll",
+            "-delay", "0",
+            "-rc", "cbr",
+            "-b:v", "2M",
+            "-maxrate", "2M",
+            "-bufsize", "200k",
+            "-g", "10",
+            "-bf", "0",
+            "-forced-idr", "1",
+            "-bsf:v", "h264_mp4toannexb",
+            "-f", "h264",
+            "pipe:1",
+        }
+    }
 
-	cmd := exec.Command(ffmpegCmd, ffmpegArgs...)
+    cmd := exec.Command("ffmpeg", ffmpegArgs...)
+    ffmpegIn, _ := cmd.StdinPipe()
+    ffmpegOut, _ := cmd.StdoutPipe()
+    cmd.Start()
 
-	ffmpegIn, err := cmd.StdinPipe()
-	if err != nil {
-		log.Printf("gortsplib: ffmpeg stdin pipeエラー: %v", err)
-		return
-	}
-	ffmpegOut, err := cmd.StdoutPipe()
-	if err != nil {
-		log.Printf("gortsplib: ffmpeg stdout pipeエラー: %v", err)
-		return
-	}
-	ffmpegErr, err := cmd.StderrPipe()
-	if err != nil {
-		log.Printf("gortsplib: ffmpeg stderr pipeエラー: %v", err)
-		return
-	}
+    // 1. H.265 NAL書き込み用ゴルーチン（高優先度）
+    go func() {
+        defer ffmpegIn.Close()
+        
+        // 初期パラメータ送信
+        if formaH265.VPS != nil {
+            ffmpegIn.Write(append([]byte{0x00, 0x00, 0x00, 0x01}, formaH265.VPS...))
+        }
+        if formaH265.SPS != nil {
+            ffmpegIn.Write(append([]byte{0x00, 0x00, 0x00, 0x01}, formaH265.SPS...))
+        }
+        if formaH265.PPS != nil {
+            ffmpegIn.Write(append([]byte{0x00, 0x00, 0x00, 0x01}, formaH265.PPS...))
+        }
 
-	if err := cmd.Start(); err != nil {
-		log.Printf("gortsplib: ffmpegの開始エラー: %v", err)
-		return
-	}
-	log.Println("gortsplib: ffmpegプロセスを開始しました")
+        // バッチ処理で効率化
+        batch := make([]byte, 0, 1024*1024) // 1MBバッファ
+        batchCount := 0
+        
+        for nal := range nalChan {
+            nalWithStartCode := append([]byte{0x00, 0x00, 0x00, 0x01}, nal...)
+            batch = append(batch, nalWithStartCode...)
+            batchCount++
+            
+            // 小さなバッチサイズで即座に送信（遅延最小化）
+            if batchCount >= 3 || len(batch) > 64*1024 {
+                if _, err := ffmpegIn.Write(batch); err != nil {
+                    return
+                }
+                batch = batch[:0] // バッファリセット
+                batchCount = 0
+            }
+        }
+        
+        // 残りのデータを送信
+        if len(batch) > 0 {
+            ffmpegIn.Write(batch)
+        }
+    }()
 
-	go func() {
-		scanner := bufio.NewScanner(ffmpegErr)
-		for scanner.Scan() {
-			log.Printf("ffmpeg stderr: %s", scanner.Text())
-		}
-	}()
+    // 2. H.264 NAL読み取り用ゴルーチン（高優先度）
+    go func() {
+        defer close(h264NALChan)
+        
+        h264NALReader, err := h264reader.NewReader(ffmpegOut)
+        if err != nil {
+            return
+        }
 
-	go func() {
-		defer cmd.Wait() 
-		defer ffmpegIn.Close() 
-		h264NALReader, err := h264reader.NewReader(ffmpegOut)
-		if err != nil {
-			log.Printf("gortsplib: H.264リーダーの作成エラー: %v", err)
-			return
-		}
-		log.Println("gortsplib: ffmpegからのH.264 NALの読み取りを開始します")
+        for {
+            nal, err := h264NALReader.NextNAL()
+            if err != nil {
+                break
+            }
+            if nal != nil && len(nal.Data) > 0 {
+                // 非ブロッキング送信で遅延防止
+                select {
+                case h264NALChan <- nal.Data:
+                default:
+                    // チャネルが満杯の場合はスキップ（遅延防止）
+                }
+            }
+        }
+    }()
 
-		frameDuration := time.Second / 30 
-		fmtpMap := formaH265.FMTP()
-		if fmtpMap != nil {
-			if framerateVal, ok := fmtpMap["framerate"]; ok {
-				fps, err := strconv.ParseFloat(framerateVal, 64)
-				if err == nil && fps > 0 {
-					frameDuration = time.Duration(float64(time.Second) / fps)
-					log.Printf("gortsplib: H.265 SDP FMTPからフレームレート %s FPS を検出。H.264のフレーム期間目安: %v", framerateVal, frameDuration)
-				}
-			}
-		}
+    // 3. WebRTC送信用ゴルーチン（最高優先度）
+    go func() {
+        frameDuration := time.Second / 30
+        fmtpMap := formaH265.FMTP()
+        if fmtpMap != nil {
+            if framerateVal, ok := fmtpMap["framerate"]; ok {
+                if fps, err := strconv.ParseFloat(framerateVal, 64); err == nil && fps > 0 {
+                    frameDuration = time.Duration(float64(time.Second) / fps)
+                }
+            }
+        }
 
-		for {
-			nal, err := h264NALReader.NextNAL()
-			if err == io.EOF {
-				log.Println("gortsplib: ffmpegからのH.264ストリームが終了しました (EOF)")
-				break
-			}
-			if err != nil {
-				log.Printf("gortsplib: ffmpegからのH.264 NAL読み取りエラー: %v", err)
-				break
-			}
-			if nal == nil || len(nal.Data) == 0 {
-				continue
-			}
-			writeNALsToTracks([][]byte{nal.Data}, frameDuration)
-		}
-		log.Println("gortsplib: ffmpegからのH.264 NALの読み取りを終了しました")
-	}()
+        for h264NAL := range h264NALChan {
+            writeNALsToTracks([][]byte{h264NAL}, frameDuration)
+        }
+    }()
 
-	if formaH265.VPS != nil {
-		log.Println("gortsplib: VPSをffmpegに送信中")
-		if _, err := ffmpegIn.Write(append([]byte{0x00, 0x00, 0x00, 0x01}, formaH265.VPS...)); err != nil {
-			log.Printf("gortsplib: ffmpegへのVPS書き込みエラー: %v", err)
-			// return // ここで return すると起動シーケンスが止まるので注意
-		}
-	}
-	if formaH265.SPS != nil {
-		log.Println("gortsplib: SPSをffmpegに送信中")
-		if _, err := ffmpegIn.Write(append([]byte{0x00, 0x00, 0x00, 0x01}, formaH265.SPS...)); err != nil {
-			log.Printf("gortsplib: ffmpegへのSPS書き込みエラー: %v", err)
-			// return
-		}
-	}
-	if formaH265.PPS != nil {
-		log.Println("gortsplib: PPSをffmpegに送信中")
-		if _, err := ffmpegIn.Write(append([]byte{0x00, 0x00, 0x00, 0x01}, formaH265.PPS...)); err != nil {
-			log.Printf("gortsplib: ffmpegへのPPS書き込みエラー: %v", err)
-			// return
-		}
-	}
+    _, err = c.Setup(desc.BaseURL, medi, 0, 0)
+    if err != nil {
+        log.Printf("gortsplib: RTSPメディアのセットアップエラー: %v", err)
+        return
+    }
 
-	_, err = c.Setup(desc.BaseURL, medi, 0, 0)
-	if err != nil {
-		log.Printf("gortsplib: RTSPメディアのセットアップエラー: %v", err)
-		return
-	}
-	log.Println("gortsplib: RTSPメディアのセットアップ完了")
+    // 4. RTPパケット受信（メインスレッド）- 非ブロッキング処理
+    c.OnPacketRTP(medi, formaH265, func(pkt *rtp.Packet) {
+        au, err := rtpDec.Decode(pkt)
+        if err != nil {
+            if err != rtph265.ErrNonStartingPacketAndNoPrevious && err != rtph265.ErrMorePacketsNeeded {
+                // エラーログを削除して高速化
+            }
+            return
+        }
 
-	c.OnPacketRTP(medi, formaH265, func(pkt *rtp.Packet) {
-		au, err := rtpDec.Decode(pkt)
-		if err != nil {
-			// rtph265.ErrFrameTooLarge は存在しないため削除
-			if err != rtph265.ErrNonStartingPacketAndNoPrevious && err != rtph265.ErrMorePacketsNeeded {
-				log.Printf("gortsplib: H.265 RTPデコードエラー: %v", err)
-			}
-			return
-		}
+        if len(au) > 0 {
+            for _, nal := range au {
+                if len(nal) == 0 {
+                    continue
+                }
+                // 非ブロッキング送信
+                select {
+                case nalChan <- nal:
+                default:
+                    // チャネルが満杯の場合はスキップ（遅延防止）
+                }
+            }
+        }
+    })
 
-		if len(au) > 0 {
-			for _, nal := range au {
-				if len(nal) == 0 {
-					continue
-				}
-				nalWithStartCode := append([]byte{0x00, 0x00, 0x00, 0x01}, nal...)
-				if _, err := ffmpegIn.Write(nalWithStartCode); err != nil {
-					// log.Printf("gortsplib: ffmpegへのNAL書き込みエラー: %v", err)
-					return 
-				}
-			}
-		}
-	})
+    _, err = c.Play(nil)
+    if err != nil {
+        log.Printf("gortsplib: RTSP再生の開始エラー: %v", err)
+        return
+    }
 
-	_, err = c.Play(nil)
-	if err != nil {
-		log.Printf("gortsplib: RTSP再生の開始エラー: %v", err)
-		return
-	}
-	log.Println("gortsplib: H.265 RTSP再生が開始されました。ffmpeg経由でWebRTCにストリーミング中...")
+    log.Println("gortsplib: 並列H.265→H.264変換開始。WebRTCにストリーミング中...")
 
-	clientErr := c.Wait()
-	log.Printf("gortsplib: RTSPクライアント処理終了: %v", clientErr)
-
-	log.Println("gortsplib: RTSPクライアント終了のため、ffmpegへの入力を閉じます")
-	ffmpegIn.Close() 
-
-	log.Println("gortsplib: H.265 to H.264 トランスコーディング処理を終了します")
+    clientErr := c.Wait()
+    close(nalChan) // チャネルを閉じてゴルーチンを終了
+    
+    log.Printf("gortsplib: 並列処理完了: %v", clientErr)
 }

@@ -237,7 +237,7 @@ func startFFmpegH265ToH264NALCPURTP(inputURL string) {
 			"-g", "30",
 			"-bf", "0",
 			"-fps_mode", "passthrough",
-			"-map", "0:v:0",
+			// "-map", "0:v:0",
 			"-f", "h264",
 			"pipe:1",
 		})
