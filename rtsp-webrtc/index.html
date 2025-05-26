@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RTSP → WebRTC Viewer</title>
+  <script defer>
+    document.addEventListener("DOMContentLoaded", () => {
+      console.log("DOMContentLoaded event fired.");
+      // Parse query parameters for custom signaling server and room
+      const params = new URLSearchParams(window.location.search);
+      const room = params.get('room');
+      const server = params.get('server') || window.location.host;
+      const protocol = (window.location.protocol === 'https:') ? 'wss' : 'ws';
+      const wsUrl = `${protocol}://${server}/ws${room ? `?room=${room}` : ''}`;
+      const video = document.getElementById("remoteVideo");
+      const ws = new WebSocket(wsUrl);
+      let pc;
+      // ICE candidate buffer until offer is sent
+      let candidateQueue = [];
+      let serverCandidateQueue = [];
+
+      ws.addEventListener("open", async () => {
+        console.log("WebSocket connection opened."); 
+        try {
+          pc = new RTCPeerConnection({
+            iceServers: [
+              // Googleの公開STUNサーバーを使用
+              { urls: "stun:stun.l.google.com:19302" }
+            ], 
+          });
+          console.log("RTCPeerConnection created."); 
+
+          pc.onicecandidateerror = (event) => {
+            console.error("ICE candidate error event:", event);
+            // RTCPeerConnectionIceErrorEvent has details like address, port, url, errorCode, errorText
+            if (event.url && event.errorCode && event.errorText) {
+              console.error(`ICE Candidate Error: URL=${event.url}, Code=${event.errorCode}, Text=${event.errorText}`);
+            }
+          };
+
+          pc.oniceconnectionstatechange = (event) => {
+            console.log(`ICE connection state changed: ${pc.iceConnectionState}`, event);
+          };
+
+          pc.ontrack = (e) => {
+            console.log("pc.ontrack event:", e); 
+            if (video.srcObject !== e.streams[0]) video.srcObject = e.streams[0];
+          };
+
+          // ICE候補が見つかったらサーバーに送信
+          pc.onicecandidate = (event) => {
+            if (event.candidate) {
+              console.log("Buffering ICE candidate:", event.candidate.candidate);
+              candidateQueue.push(event.candidate);
+            } else {
+              console.log("All ICE candidates gathered, sending SDP offer.");
+              if (pc.localDescription?.sdp) {
+                ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription.sdp }));
+                console.log("Offer sent to server after ICE gathering.");
+              }
+              // Flush buffered ICE candidates
+              candidateQueue.forEach(candidate => {
+                console.log("Sending buffered ICE candidate:", candidate.candidate);
+                ws.send(JSON.stringify({ type: "candidate", candidate }));
+              });
+            }
+          };
+
+          console.log("Creating offer and starting ICE gathering...");
+          const offer = await pc.createOffer({ offerToReceiveVideo: true });
+          await pc.setLocalDescription(offer);
+          console.log("Local description set, waiting for ICE candidates..."); 
+
+        } catch (error) {
+          console.error("Error in WebSocket 'open' handler:", error); 
+        }
+      });
+
+      ws.addEventListener("message", async ({ data }) => {
+        console.log("Raw message data from server:", data); 
+        try {
+          const msg = JSON.parse(data);
+          console.log("◀️ Message from server (parsed):", msg); 
+          if (msg.type === "answer") {
+            console.log("✔️ Answer SDP:", msg.sdp);
+            if (!msg.sdp) {
+                console.error("Answer SDP is missing or empty.");
+                return;
+            }
+            // Set remote description
+            await pc.setRemoteDescription(
+              new RTCSessionDescription({ type: "answer", sdp: msg.sdp })
+            );
+            console.log("Remote description (answer) set.");
+
+            // Flush any buffered server ICE candidates
+            console.log("Flushing buffered server ICE candidates:", serverCandidateQueue.length);
+            for (const c of serverCandidateQueue) {
+              await pc.addIceCandidate(new RTCIceCandidate(c));
+              console.log("Added buffered server ICE candidate:", c);
+            }
+            serverCandidateQueue = [];
+
+          } else if (msg.type === "candidate") {
+            console.log("Received ICE candidate from server:", msg.candidate);
+            if (msg.candidate) {
+              // Buffer until remote description is set
+              if (!pc.remoteDescription) {
+                console.log("Buffering server ICE candidate (remote not set yet):", msg.candidate);
+                serverCandidateQueue.push(msg.candidate);
+              } else {
+                await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                console.log("Added server ICE candidate:", msg.candidate);
+              }
+            } else {
+              console.warn("Received null or empty candidate from server.");
+            }
+          } else {
+            console.warn("Received unknown message type from server:", msg.type);
+          }
+        } catch (error) {
+          console.error("Error processing message from server:", error, "Raw data:", data);
+        }
+      });
+
+      ws.addEventListener("error", (event) => {
+        console.error("WebSocket error observed:", event); 
+      });
+
+      ws.addEventListener("close", (event) => {
+        console.log("WebSocket connection closed. Code:", event.code, "Reason:", event.reason, "wasClean:", event.wasClean); 
+      });
+    });
+  </script>
+  <style>
+    body { 
+        background-color: #111827; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;
+    }
+    video { 
+        width: 100%; max-width: 64rem; border-radius: 1rem; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05);
+    }
+  </style>
+</head>
+<body>
+  <video id="remoteVideo" autoplay playsinline muted disablePictureInPicture disableRemotePlayback preload="metadata"></video>
+</body>
+</html>

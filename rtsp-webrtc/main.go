@@ -148,7 +148,12 @@ func main() {
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		signalingHandler(w, r)
 	})
-	log.Printf("サーバーが :%s で起動しました", serverPort)
-	log.Fatal(http.ListenAndServe(":"+serverPort, nil))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "prev.html")
+	})
+	// ローカル外部アクセスを許可するため、ListenAndServeのアドレスを 0.0.0.0 から指定IPに変更可能にします
+	addr := "0.0.0.0:" + serverPort
+	log.Printf("サーバーが %s で起動しました", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
 

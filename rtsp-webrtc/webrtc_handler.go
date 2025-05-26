@@ -32,6 +32,13 @@ var (
 
 // --- WebSocketシグナリングハンドラー ---
 func signalingHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract room parameter for per-room signaling
+	room := r.URL.Query().Get("room")
+	if room == "" {
+		room = "default"
+	}
+	log.Printf("WebSocket接続 (room: %s, codec: %s)", room, currentCodec)
+
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocketアップグレード失敗: %v", err)

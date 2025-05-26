@@ -7,10 +7,13 @@
   <script defer>
     document.addEventListener("DOMContentLoaded", () => {
       console.log("DOMContentLoaded event fired."); 
-      const wsUrl = `ws://localhost:8080/ws`;
+      const wsUrl = `wss://ws.zawa.dev/ws`;
       const video = document.getElementById("remoteVideo");
       const ws = new WebSocket(wsUrl);
       let pc;
+      // ICE candidate buffer until offer is sent
+      let candidateQueue = [];
+      let serverCandidateQueue = [];
 
       ws.addEventListener("open", async () => {
         console.log("WebSocket connection opened."); 
@@ -41,46 +44,29 @@
           };
 
           // ICE候補が見つかったらサーバーに送信
-          pc.onicecandidate = ({ candidate }) => {
-            if (candidate) {
-              console.log("Sending ICE candidate:", candidate.candidate); 
-              ws.send(JSON.stringify({ type: "candidate", candidate: candidate.candidate }));
+          pc.onicecandidate = (event) => {
+            if (event.candidate) {
+              console.log("Buffering ICE candidate:", event.candidate.candidate);
+              candidateQueue.push(event.candidate);
             } else {
-              console.log("All ICE candidates have been gathered and sent.");
+              console.log("All ICE candidates gathered, sending SDP offer.");
+              if (pc.localDescription?.sdp) {
+                ws.send(JSON.stringify({ type: "offer", sdp: pc.localDescription.sdp }));
+                console.log("Offer sent to server after ICE gathering.");
+              }
+              // Flush buffered ICE candidates
+              candidateQueue.forEach(candidate => {
+                console.log("Sending buffered ICE candidate:", candidate.candidate);
+                ws.send(JSON.stringify({ type: "candidate", candidate }));
+              });
             }
           };
 
-          console.log("Creating offer..."); 
-          const offer = await pc.createOffer({ offerToReceiveVideo: true }); 
-          console.log("Offer created:", offer);           
-          console.log("Setting local description with offer...");  
-          try {
-            await pc.setLocalDescription(offer);
-            console.log("Local description set successfully."); 
-            console.log("pc.localDescription after setLocalDescription:", pc.localDescription); 
-            
-            // オファーをサーバーに送信
-            if (pc.localDescription && pc.localDescription.sdp) {
-              console.log("▶️ pc.localDescription (final for offer):", pc.localDescription);
-              console.log("▶️ pc.localDescription.sdp (final for offer):", pc.localDescription.sdp);
-              const offerPayload = { type: "offer", sdp: pc.localDescription.sdp };
-              const offerPayloadString = JSON.stringify(offerPayload);
-              console.log("▶️ Offer payload to send (string):", offerPayloadString);
-              
-              if (offerPayloadString && offerPayloadString !== "{}") { 
-                ws.send(offerPayloadString);
-                console.log("Offer sent to server."); 
-              } else {
-                console.error("Offer payload string is empty or invalid. Not sending. Payload:", offerPayloadString);
-              }
-            } else {
-               console.error("Local description or SDP is missing after setLocalDescription. Cannot send offer.");
-            }
+          console.log("Creating offer and starting ICE gathering...");
+          const offer = await pc.createOffer({ offerToReceiveVideo: true });
+          await pc.setLocalDescription(offer);
+          console.log("Local description set, waiting for ICE candidates..."); 
 
-          } catch (err) {
-            console.error("Error setting local description or sending offer:", err);
-           }
- 
         } catch (error) {
           console.error("Error in WebSocket 'open' handler:", error); 
         }
@@ -97,16 +83,33 @@
                 console.error("Answer SDP is missing or empty.");
                 return;
             }
+            // Set remote description
             await pc.setRemoteDescription(
               new RTCSessionDescription({ type: "answer", sdp: msg.sdp })
             );
-            console.log("Remote description (answer) set."); 
+            console.log("Remote description (answer) set.");
+
+            // Flush any buffered server ICE candidates
+            console.log("Flushing buffered server ICE candidates:", serverCandidateQueue.length);
+            for (const c of serverCandidateQueue) {
+              await pc.addIceCandidate(new RTCIceCandidate(c));
+              console.log("Added buffered server ICE candidate:", c);
+            }
+            serverCandidateQueue = [];
+
           } else if (msg.type === "candidate") {
-            console.log("Received ICE candidate from server:", msg.candidate); 
-            if (msg.candidate) { 
-                await pc.addIceCandidate(new RTCIceCandidate(msg.candidate)); 
+            console.log("Received ICE candidate from server:", msg.candidate);
+            if (msg.candidate) {
+              // Buffer until remote description is set
+              if (!pc.remoteDescription) {
+                console.log("Buffering server ICE candidate (remote not set yet):", msg.candidate);
+                serverCandidateQueue.push(msg.candidate);
+              } else {
+                await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+                console.log("Added server ICE candidate:", msg.candidate);
+              }
             } else {
-                console.warn("Received null or empty candidate from server.");
+              console.warn("Received null or empty candidate from server.");
             }
           } else {
             console.warn("Received unknown message type from server:", msg.type);
