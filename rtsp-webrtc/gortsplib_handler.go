@@ -410,3 +410,152 @@ func startGortsplibH265toH264RTSP(props props) {
     
     log.Printf("gortsplib: 並列処理完了: %v", clientErr)
 }
+
+// --- H.265 RTSP パススルー (gortsplib 版・超低遅延) ---
+// startGortsplibH265RTSP は、指定されたRTSP URLからH.265ストリームを取得し、
+// WebRTCハンドラー (webrtc_handler.go の writeNALsToTracksH265) にNALユニットを渡します。
+func startGortsplibH265RTSP(props props) {
+	c := gortsplib.Client{
+		// OnResponse は、サーバーからのレスポンス受信時に呼び出されます。
+		// ここでは、Content-Base ヘッダーを正規化するために使用しています。
+		OnResponse: func(res *base.Response) {
+			if res.StatusCode == base.StatusOK {
+				sanitizeContentBase(res)
+			}
+		},
+	}
+
+	u, err := base.ParseURL(props.inputURL)
+	log.Println("gortsplib: H.265入力URLを解析中:", u.Host) // 初期化時のログはパフォーマンスに影響小
+	if err != nil {
+		log.Printf("入力URLの解析エラー: %v", err)
+		return
+	}
+
+	// サーバーに接続
+	err = c.Start(u.Scheme, u.Host)
+	if err != nil {
+		log.Printf("RTSPサーバーへの接続エラー: %v", err)
+		return
+	}
+	defer c.Close()
+	log.Println("gortsplib: RTSPサーバーに接続しました (H.265)") // 初期化時のログ
+
+	// 利用可能なメディアを検索 (DESCRIBEリクエスト)
+	desc, _, err := c.Describe(u)
+	if err != nil {
+		log.Printf("RTSPストリームの記述エラー: %v", err)
+		return
+	}
+
+	// H265メディアとフォーマットを検索
+	var forma *format.H265
+	medi := desc.FindFormat(&forma)
+	if medi == nil {
+		log.Println("gortsplib: H.265メディアが見つかりません")
+		return
+	}
+	log.Println("gortsplib: H.265メディアが見つかりました") // 初期化時のログ
+
+	// RTP -> H265デコーダーをセットアップ (gortsplibの場合、これはNALユニットエクストラクタとして機能)
+	rtpDec, err := forma.CreateDecoder()
+	if err != nil {
+		log.Printf("H.265 RTPデコーダーの作成エラー: %v", err)
+		return
+	}
+
+	// VPS、SPS、PPSがSDPに存在する場合、それらをWebRTCトラックに送信します。
+	// これらはビデオストリームの開始前にクライアントに送信される必要があります。
+	initialNALs := [][]byte{}
+	if forma.VPS != nil {
+		initialNALs = append(initialNALs, forma.VPS)
+		log.Println("gortsplib: VPSをWebRTCトラックに送信中") // 初期化時のログ
+	}
+	if forma.SPS != nil {
+		initialNALs = append(initialNALs, forma.SPS)
+		log.Println("gortsplib: SPSをWebRTCトラックに送信中") // 初期化時のログ
+	}
+	if forma.PPS != nil {
+		initialNALs = append(initialNALs, forma.PPS)
+		log.Println("gortsplib: PPSをWebRTCトラックに送信中") // 初期化時のログ
+	}
+	if len(initialNALs) > 0 {
+		// VPS/SPS/PPSのような設定NALの場合、期間は厳密には重要ではありません。
+		// ここでは一般的なフレームレートを想定したデフォルト値を使用しています。
+		writeNALsToTracksH265(initialNALs, time.Second/30) // デフォルトの期間として30 FPSを想定
+	}
+
+	// 単一メディアをセットアップ (SETUPリクエスト)
+	log.Printf("gortsplib: RTSP H.265メディア %v をセットアップ中", medi) // 初期化時のログ
+	_, err = c.Setup(desc.BaseURL, medi, 0, 0)
+	if err != nil {
+		log.Printf("RTSP H.265メディアのセットアップエラー: %v", err)
+		return
+	}
+	log.Println("gortsplib: RTSP H.265メディアのセットアップ完了") // 初期化時のログ
+
+	// フレーム期間の決定。
+	// デフォルトで30 FPSを想定
+	frameDuration := time.Second / 30
+	log.Printf("gortsplib: デフォルトのフレーム期間: %v (30 FPS相当)", frameDuration)
+
+	// SDPのfmtp属性からフレームレートに関連する情報を解析する試み
+	// format.H265 の FMTP() メソッドを使用
+	fmtpMap := forma.FMTP()
+	if fmtpMap != nil {
+		if framerateVal, ok := fmtpMap["framerate"]; ok {
+			fps, err := strconv.ParseFloat(framerateVal, 64)
+			if err == nil && fps > 0 {
+				frameDuration = time.Duration(float64(time.Second) / fps)
+				log.Printf("gortsplib: SDP FMTPからフレームレート %s FPS を検出。新しいフレーム期間: %v", framerateVal, frameDuration)
+			} else if err != nil {
+				log.Printf("gortsplib: SDP FMTPのフレームレート値 '%s' の解析エラー: %v。デフォルトのフレーム期間を使用します。", framerateVal, err)
+			} else {
+				log.Printf("gortsplib: SDP FMTPのフレームレート値 '%s' が無効 (0以下)。デフォルトのフレーム期間を使用します。", framerateVal)
+			}
+		} else {
+			log.Println("gortsplib: SDP FMTPに 'framerate' が見つかりません。デフォルトのフレーム期間を使用します。")
+		}
+	} else {
+		log.Println("gortsplib: SDPにFMTP属性が見つかりません。デフォルトのフレーム期間を使用します。")
+	}
+
+	// OnPacketRTP は、RTPパケット到着時に呼び出されるコールバックです。
+	// このコールバック内の処理は、パケット受信ごとに行われるため、効率性が重要です。
+	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
+
+		// RTPパケットからアクセスユニット（NALユニット群）を抽出します。
+		// au は [][]byte 型で、1つ以上のNALユニットを含みます。
+		au, err := rtpDec.Decode(pkt) // au は [][]byte です
+		if err != nil {
+			// ErrNonStartingPacketAndNoPrevious: フレームの先頭パケットではないが、前のパケットがない場合 (順序が乱れた場合など)
+			// ErrMorePacketsNeeded: パケットが分割されており、アクセスユニットを完成させるにはさらにパケットが必要な場合
+			// これらは必ずしも致命的なエラーではなく、ストリームの特性上発生しうるため、ログレベルを調整するか、特定の条件下では無視することも検討できます。
+			if err != rtph265.ErrNonStartingPacketAndNoPrevious && err != rtph265.ErrMorePacketsNeeded {
+				log.Printf("gortsplib: H.265 RTPデコードエラー: %v", err) // エラー発生時のみログ出力
+			}
+			return
+		}
+
+		// 抽出されたNALユニットが存在する場合のみ処理
+		if len(au) > 0 {
+			// writeNALsToTracksH265 は、NALユニット群をH.265 WebRTCトラックに書き込みます。
+			// この関数は webrtc_handler.go で定義されており、複数のWebRTCクライアントへの配信処理を含みます。
+			// この呼び出しがボトルネックになる場合は、webrtc_handler.go側の最適化や、
+			// 非同期処理（ただしNALの順序保証が必要）を検討する必要があります。
+			writeNALsToTracksH265(au, frameDuration)
+		}
+	})
+
+	// 再生開始 (PLAYリクエスト)
+	_, err = c.Play(nil)
+	if err != nil {
+		log.Printf("RTSP再生の開始エラー: %v", err)
+		return
+	}
+	log.Println("gortsplib: H.265 RTSP再生が開始されました。WebRTCにストリーミング中...") // 初期化時のログ
+
+	// 致命的なエラーが発生するか、ストリームが終了するまで待機
+	// c.Wait() は通常、エラーが発生した場合にそのエラーを返します。正常終了時は nil を返すこともあります。
+	log.Printf("gortsplib: H.265クライアント処理終了: %v", c.Wait()) // 終了時のログ
+}

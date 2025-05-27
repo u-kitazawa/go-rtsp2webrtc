@@ -11,12 +11,6 @@ GO RTSP 2 WebRTC は、RTSP ストリームを WebRTC ストリームに変換�
 
 RTSP ストリームを WebRTC ストリームに変換するサーバーです。標準的な WebRTC 機能を使用して映像を配信します。
 
-### `rtsp-webrtc-webcodecs`
-
-RTSP ストリームを WebRTC ストリームに変換するサーバーです。WebCodecs API を使用して、ブラウザ側でデコードします。
-webCodecs は対応ブラウザが限られているため、注意が必要です。
-また、webRTC の DataChannel を使用して、映像データを送信します。
-
 ### `webrtc-dc-rtsp-webrtc`（実装予定）
 
 WebRTC の DataChannel を使用して、RTSP ストリームの映像データを受信し、WebRTC ストリームに変換するサーバーです。RTSP ストリームを Android 端末などで転送する必要があるときに使用します。
@@ -51,7 +45,6 @@ FFmpeg は公式サイトからダウンロードできます。
 - `-processor`: H.265 トランスコーディングに使用するプロセッサを指定します。`cpu`または`gpu`が指定可能です。デフォルトは`gpu`です。
 - `-input-type`: 入力タイプを指定します。`rtsp`、`rtp`、または`server`が指定可能です。デフォルトは`rtsp`です。
 - `-use-gortsplib`: RTSP パススルーに gortsplib を使用するかどうかを指定します。`true`または`false`が指定可能です。デフォルトは`false`です。
-- `-output-mode`: 出力モードを指定します。`webrtc`または`webcodecs`が指定可能です。デフォルトは`webrtc`です。
 
 ## 開発
 
@@ -95,7 +88,7 @@ go build -o rtsp-webrtc-server.exe .
 ./rtsp-webrtc-server.exe -input-url "rtsp://example.com/stream"
 
 # 実行例（すべてのオプションを指定）
-./rtsp-webrtc-server.exe -input-url "rtsp://example.com/stream" -port 8080 -codec h264 -processor gpu -input-type rtsp -use-gortsplib false -output-mode webrtc
+./rtsp-webrtc-server.exe -input-url "rtsp://example.com/stream" -port 8080 -codec h264 -processor gpu -input-type rtsp -use-gortsplib false
 
 # 実行例（RTSPサーバーモード）
 ./rtsp-webrtc-server.exe -input-type server -use-gortsplib true

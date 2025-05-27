@@ -4,48 +4,37 @@ import (
 	"flag"
 	"log"
 	"net/http"
-	"sync" // 追加
-
-	"github.com/gorilla/websocket" // 追加
 )
 
 // --- トラックリストとミューテックス ---
 var (
 	inputURL     string // RTSP URL または RTP SDP ファイルパス
 	serverPort   string
-	codec        string // "h264" または "h265"
+	codec        string // "h264" または "h265" (入力コーデック)
+	outputCodec  string // "h264" または "h265" (出力コーデック、H.265入力時のみ使用)
 	processor    string // H.265 トランスコーディング用の "cpu" または "gpu"
 	inputType    string // "rtsp" または "rtp" または "server"
 	useGortsplib string // gortsplib パススルー用の "true" または "false"
-	outputMode   string // "webrtc" または "webcodecs" を追加
-
-	webcodecClientsMutex sync.RWMutex // 追加
-	webcodecClients      = make(map[*websocket.Conn]bool) // 追加
-
-	// SPS/PPSを一度受信したら保存し、新しいwebcodecクライアントに送信するため
-	spsNAL []byte // 追加
-	ppsNAL []byte // 追加
-	// codecConfigSentToWebcodecClients は、特定のクライアントに設定が送信されたかどうかを追跡します
-	codecConfigSentToWebcodecClients = make(map[*websocket.Conn]bool) // 追加
 )
 
 type props struct {
-	codec      string
-	serverPort string
-	processor  string
-	inputType  string
-	inputURL   string
-	outputMode string // 追加
-	fps 			int // 追加: フレームレートを追加
+	codec       string
+	outputCodec string
+	serverPort  string
+	processor   string
+	inputType   string
+	inputURL    string
+	fps         int // 追加: フレームレートを追加
 }
 
-func main() {	flag.StringVar(&inputURL, "input-url", "", "カメラのRTSP URLまたはRTP SDPファイルパス (server モードでは不要)")
+func main() {
+	flag.StringVar(&inputURL, "input-url", "", "カメラのRTSP URLまたはRTP SDPファイルパス (server モードでは不要)")
 	flag.StringVar(&serverPort, "port", "8080", "サーバーポート")
 	flag.StringVar(&codec, "codec", "h264", "入力に使用するコーデック (h264 または h265)")
-	flag.StringVar(&processor, "processor", "gpu", "H.265トランスコーディングに使用するプロセッサ (cpu または gpu)")
-	flag.StringVar(&inputType, "input-type", "rtsp", "入力タイプ (rtsp, rtp, server)")
+	flag.StringVar(&outputCodec, "output-codec", "h264", "出力コーデック (h264 または h265) - H.265入力時のみ有効")
+	flag.StringVar(&processor, "processor", "cpu", "H.265トランスコーディングに使用するプロセッサ (cpu または gpu)")
+	flag.StringVar(&inputType, "input-type", "rtsp", "入力タイプ (rtsp, rtp, server)")	
 	flag.StringVar(&useGortsplib, "use-gortsplib", "false", "RTSPパススルーにgortsplibを使用する (true または false)")
-	flag.StringVar(&outputMode, "output-mode", "webrtc", "出力モード: webrtc または webcodecs") // 追加
 	flag.Parse()
 
 	// サーバーモードの場合は入力URLチェックをスキップ
@@ -53,30 +42,42 @@ func main() {	flag.StringVar(&inputURL, "input-url", "", "カメラのRTSP URL�
 		log.Fatal("入力URL（RTSPまたはRTP SDPファイル）を指定する必要があります。現在の入力タイプ: ", inputType)
 	}
 	
-	if inputType == "server" {
-		log.Printf("入力タイプ: %s, コーデック: %s, 出力モード: %s を使用します (RTSPサーバーモード)", inputType, codec, outputMode)
-	} else {
-		log.Printf("入力URL: %s, 入力タイプ: %s, コーデック: %s, 出力モード: %s を使用します", inputURL, inputType, codec, outputMode)
-	}
-	if codec == "h265" {
-		log.Printf("H.265トランスコーディングプロセッサ: %s", processor)
-	}
-	props := props{
-		codec:      codec,
-		serverPort: serverPort,
-		processor:  processor,
-		inputType:  inputType,
-		inputURL:   inputURL,
-		outputMode: outputMode, // 追加
-		fps:        30, // デフォルトのフレームレートを設定 (必要に応じて変更可能)
+	// 出力コーデックの妥当性チェック
+	if outputCodec != "h264" && outputCodec != "h265" {
+		log.Fatalf("サポートされていない出力コーデック: %s。'h264' または 'h265' を使用してください。", outputCodec)
 	}
 	
-	if useGortsplib == "true" { // 修正: 文字列比較を正しく行う
+	// H.264入力時に出力コーデックがH.265の場合は警告
+	if codec == "h264" && outputCodec == "h265" {
+		log.Printf("警告: H.264入力からH.265出力への変換は現在サポートされていません。出力をH.264に設定します。")
+		outputCodec = "h264"
+	}
+	
+	if inputType == "server" {
+		log.Printf("入力タイプ: %s, コーデック: %s を使用します (RTSPサーバーモード)", inputType, codec)	} else {
+		log.Printf("入力URL: %s, 入力タイプ: %s, コーデック: %s を使用します", inputURL, inputType, codec)
+	}
+	
+	if codec == "h265" {
+		log.Printf("H.265入力 -> %s出力, プロセッサ: %s", outputCodec, processor)
+	}
+	
+	props := props{
+		codec:       codec,
+		outputCodec: outputCodec,
+		serverPort:  serverPort,
+		processor:   processor,
+		inputType:   inputType,
+		inputURL:    inputURL,
+		fps:         30, // デフォルトのフレームレートを設定 (必要に応じて変更可能)
+	}
+	
+	if useGortsplib == "true" {
 		log.Println("RTSPパススルーまたはトランスコーディングにgortsplibベースのハンドラーを使用します")
-		switch inputType {
-		case "server":
+		switch inputType {		case "server":
 			log.Println("RTSPサーバーモードでgortsplibベースのサーバーを起動します")
-			switch codec {			case "h264":
+			switch codec {
+			case "h264":
 				go startGortsplibH264RTSPServer(props)
 			case "h265":
 				go startGortsplibH265RTSPServer(props)
@@ -84,12 +85,20 @@ func main() {	flag.StringVar(&inputURL, "input-url", "", "カメラのRTSP URL�
 				log.Fatalf("サポートされていないコーデック: %s。'h264' または 'h265' を使用してください。", codec)
 			}
 		default:
-			switch codec {
-			case "h264":
-				go startGortsplibH264RTSP(props)
+			switch codec {			case "h264":
+				setCurrentCodec("h264")
+				go startGortsplibH264RTSP(props)			
 			case "h265":
-				log.Println("gortsplibを使用してH.265をH.264にトランスコードし、WebRTCにストリーミングします")
-				go startGortsplibH265toH264RTSP(props) // H.265用gortsplibハンドラーを呼び出す
+				// H.265入力時の出力コーデックに基づいて処理を分岐
+				if outputCodec == "h264" {
+					log.Println("gortsplibを使用してH.265をH.264にトランスコードし、WebRTCにストリーミングします")
+					setCurrentCodec("h264")
+					go startGortsplibH265toH264RTSP(props)
+				} else {
+					log.Println("gortsplibを使用してH.265をパススルーし、WebRTCにストリーミングします")
+					setCurrentCodec("h265")
+					go startGortsplibH265RTSP(props)
+				}
 			default:
 				log.Fatalf("gortsplibは現在H.264およびH.265 (->H.264トランスコード) のみをサポートしています。指定されたコーデック: %s", codec)
 			}
@@ -136,11 +145,15 @@ func main() {	flag.StringVar(&inputURL, "input-url", "", "カメラのRTSP URL�
 			log.Fatalf("サポートされていない入力タイプ: %s。'rtsp' または 'rtp' を使用してください。", inputType)
 		}
 	}
-
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) { // outputModeをハンドラに渡すためにクロージャを使用
-		signalingHandler(w, r, props.outputMode) // props.outputMode を使用
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		signalingHandler(w, r)
 	})
-	log.Printf("サーバーが :%s で起動しました", serverPort)
-	log.Fatal(http.ListenAndServe(":"+serverPort, nil))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "prev.html")
+	})
+	// ローカル外部アクセスを許可するため、ListenAndServeのアドレスを 0.0.0.0 から指定IPに変更可能にします
+	addr := "0.0.0.0:" + serverPort
+	log.Printf("サーバーが %s で起動しました", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
