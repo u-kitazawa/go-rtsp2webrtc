@@ -221,9 +221,15 @@ func startFFmpegH265ToH264NALCPURTSP(inputURL string) {
 
 // --- H.265 から H.264 へのトランスコーディング (CPU, RTP) ---
 func startFFmpegH265ToH264NALCPURTP(inputURL string) {
+	// H.265デコーディング用の強化されたパラメータ
 	cmdArgs, sdpContent, err := buildRTPCommand(inputURL, "H265",
 		[]string{ // preInputArgs
-			"-fflags", "nobuffer+genpts",
+			"-strict", "experimental",
+			"-err_detect", "ignore_err",
+			"-avioflags", "direct",
+			"-rtsp_flags", "prefer_tcp",
+			"-fflags", "+genpts+igndts",
+			"-flags", "low_delay",
 		},
 		[]string{ // postInputArgs
 			"-an",
@@ -231,13 +237,13 @@ func startFFmpegH265ToH264NALCPURTP(inputURL string) {
 			"-preset", "ultrafast",
 			"-tune", "zerolatency",
 			"-x264-params", "nal-hrd=cbr",
-			"-b:v", "6M",
-			"-maxrate", "6M",
-			"-bufsize", "6M",
+			"-b:v", "2M",
+			"-maxrate", "2M", 
+			"-bufsize", "1M",
+			"-r", "30",
 			"-g", "30",
 			"-bf", "0",
-			"-fps_mode", "passthrough",
-			// "-map", "0:v:0",
+			"-pix_fmt", "yuv420p",
 			"-f", "h264",
 			"pipe:1",
 		})
@@ -284,14 +290,13 @@ func startFFmpegH265ToH264NALCPURTP(inputURL string) {
 }
 
 // --- RTP入力用のFFmpegコマンドを構築するヘルパー関数 ---
-func buildRTPCommand(inputURL, sdpCodecName string, preInputArgs []string, postInputArgs []string) ([]string, string, error) {
-	ffmpegInputArg := inputURL
+func buildRTPCommand(inputURL, sdpCodecName string, preInputArgs []string, postInputArgs []string) ([]string, string, error) {	ffmpegInputArg := inputURL
 	var sdpContent string
 	isRTP := strings.HasPrefix(inputURL, "rtp://")
 	protocolWhitelist := "file,udp,rtp"
-
+	
 	var cmdArgs []string
-	cmdArgs = append(cmdArgs, "-loglevel", "error")
+	cmdArgs = append(cmdArgs, "-loglevel", "debug") // より詳細なデバッグ情報
 
 	if isRTP {
 		var err error
@@ -301,9 +306,16 @@ func buildRTPCommand(inputURL, sdpCodecName string, preInputArgs []string, postI
 		}
 		ffmpegInputArg = "pipe:0"
 		protocolWhitelist += ",pipe"
-
 		cmdArgs = append(cmdArgs, "-f", "sdp")
-		cmdArgs = append(cmdArgs, "-protocol_whitelist", protocolWhitelist)
+		cmdArgs = append(cmdArgs, "-protocol_whitelist", protocolWhitelist)		// H.265の場合はプローブサイズと解析時間を増やす
+		if sdpCodecName == "H265" {
+			cmdArgs = append(cmdArgs, 
+				"-probesize", "128M", 
+				"-analyzeduration", "30000000",
+				"-fflags", "+discardcorrupt",
+				"-c:v", "hevc", // H.265デコーダーを明示的に指定
+			)
+		}
 		log.Printf("Generated SDP content for %s, using pipe:0 as input.", inputURL)
 	} else {
 		cmdArgs = append(cmdArgs, "-protocol_whitelist", protocolWhitelist)
@@ -352,17 +364,32 @@ func generateSDPContent(rtpURL, sdpCodecName string) (string, error) {
 			ipVersion = "IP6"
 		}
 	}
+	// Construct SDP content line by line
+	sdpLines := []string{
+		"v=0",
+		fmt.Sprintf("o=- 0 0 IN %s %s", ipVersion, host),
+		"s=Dynamically Generated SDP",
+		fmt.Sprintf("c=IN %s %s", ipVersion, host),
+		"t=0 0",
+		fmt.Sprintf("m=video %s RTP/AVP 96", port), // Assuming payload type 96
+	}	// コーデックに応じたrtpmapとfmtp行を追加
+	if sdpCodecName == "H265" {
+		// RFC 7798で定義されているH.265のRTPマップ
+		sdpLines = append(sdpLines, "a=rtpmap:96 H265/90000")
+		// H.265に必要な最小限のパラメータ
+		sdpLines = append(sdpLines, "a=fmtp:96 profile-id=1;level-id=93;tier-flag=0")
+	} else if sdpCodecName == "H264" {
+		sdpLines = append(sdpLines, "a=rtpmap:96 H264/90000")
+		// H.264用のfmtp行を追加（必要に応じて）
+		sdpLines = append(sdpLines, "a=fmtp:96 packetization-mode=1")
+	} else {
+		// フォールバック
+		sdpLines = append(sdpLines, fmt.Sprintf("a=rtpmap:96 %s/90000", sdpCodecName))
+	}
 
-	sdpContent := fmt.Sprintf(
-		"v=0" +
-			"o=- 0 0 IN %s %s" +
-			"s=Dynamically Generated SDP" +
-			"c=IN %s %s" +
-			"t=0 0" +
-			"m=video %s RTP/AVP 96"+ // Assuming payload type 96 from error log
-			"a=rtpmap:96 %s/90000sprop-vps=QAEMAf//AWAAAAMAAAMAAAMAAAMAlqwJsprop-pps=RAHgdrAmQA==",
-		ipVersion, host, ipVersion, host, port, sdpCodecName,
-	)
+	// 正しいCRLF行末文字を使用
+	sdpContent := strings.Join(sdpLines, "\r\n") + "\r\n"
 
+	log.Printf("Generated SDP content:\n%s", sdpContent)
 	return sdpContent, nil
 } // H265は特定のfmtp行が必要な場合があります（例：profile-tier-level-id）が、FFmpegがデマックスするために厳密に必要とされることは多くありません。

@@ -38,13 +38,18 @@
           pc.ontrack = (e) => {
             console.log("pc.ontrack event:", e); 
             if (video.srcObject !== e.streams[0]) video.srcObject = e.streams[0];
-          };
-
-          // ICE候補が見つかったらサーバーに送信
+          };          // ICE候補が見つかったらサーバーに送信
           pc.onicecandidate = ({ candidate }) => {
             if (candidate) {
-              console.log("Sending ICE candidate:", candidate.candidate); 
-              ws.send(JSON.stringify({ type: "candidate", candidate: candidate.candidate }));
+              console.log("Sending ICE candidate:", candidate); 
+              ws.send(JSON.stringify({ 
+                type: "candidate", 
+                candidate: {
+                  candidate: candidate.candidate,
+                  sdpMid: candidate.sdpMid,
+                  sdpMLineIndex: candidate.sdpMLineIndex
+                }
+              }));
             } else {
               console.log("All ICE candidates have been gathered and sent.");
             }

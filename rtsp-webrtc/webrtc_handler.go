@@ -136,21 +136,61 @@ func signalingHandler(w http.ResponseWriter, r *http.Request, outputMode string)
 			if err := ws.WriteJSON(response); err != nil {
 				log.Printf("アンサーの送信失敗: %v", err)
 			}
-
 		case "candidate":
-			candidateMap, ok := p["candidate"].(map[string]interface{})
-			if !ok {
-				log.Printf("無効な候補メッセージ")
+			// ICE候補の型チェックと処理を改善
+			candidateData, exists := p["candidate"]
+			if !exists {
+				log.Printf("ICE候補メッセージに候補データが存在しません")
 				continue
 			}
-			sdpMid := candidateMap["sdpMid"].(string)
-			candidate := webrtc.ICECandidateInit{
-				Candidate:     candidateMap["candidate"].(string),
-				SDPMid:        &sdpMid,
-				SDPMLineIndex: func() *uint16 { u := uint16(candidateMap["sdpMLineIndex"].(float64)); return &u }(),
+
+			// candidateがnilの場合（end-of-candidates）
+			if candidateData == nil {
+				log.Printf("End-of-candidates signal received")
+				continue
 			}
+
+			candidateMap, ok := candidateData.(map[string]interface{})
+			if !ok {
+				log.Printf("無効な候補形式: %T", candidateData)
+				continue
+			}
+
+			// 必要なフィールドの存在確認
+			candidateStr, ok1 := candidateMap["candidate"].(string)
+			sdpMidInterface, ok2 := candidateMap["sdpMid"]
+			sdpMLineIndexInterface, ok3 := candidateMap["sdpMLineIndex"]
+
+			if !ok1 || !ok2 || !ok3 {
+				log.Printf("ICE候補に必要なフィールドが不足: candidate=%v, sdpMid=%v, sdpMLineIndex=%v", ok1, ok2, ok3)
+				continue
+			}
+
+			var sdpMid *string
+			if sdpMidVal := sdpMidInterface; sdpMidVal != nil {
+				if sdpMidStr, ok := sdpMidVal.(string); ok {
+					sdpMid = &sdpMidStr
+				}
+			}
+
+			var sdpMLineIndex *uint16
+			if sdpMLineIndexVal := sdpMLineIndexInterface; sdpMLineIndexVal != nil {
+				if idx, ok := sdpMLineIndexVal.(float64); ok {
+					val := uint16(idx)
+					sdpMLineIndex = &val
+				}
+			}
+
+			candidate := webrtc.ICECandidateInit{
+				Candidate:     candidateStr,
+				SDPMid:        sdpMid,
+				SDPMLineIndex: sdpMLineIndex,
+			}
+
 			if err := pc.AddICECandidate(candidate); err != nil {
-				log.Printf("ICE候補の追加失敗: %v", err)
+				log.Printf("ICE候補の追加失敗: %v, candidate: %+v", err, candidate)
+			} else {
+				log.Printf("ICE候補を正常に追加しました: %s", candidateStr)
 			}
 		}
 	}

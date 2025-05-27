@@ -25,21 +25,27 @@ type serverHandler struct {
 	mutex     sync.Mutex
 	publisher *gortsplib.ServerSession
 	media     *description.Media
-	
+
 	// H.264用フィールド
 	formatH264 *format.H264
 	rtpDecH264 *rtph264.Decoder
-	
+
 	// H.265用フィールド
 	formatH265   *format.H265
 	rtpDecH265   *rtph265.Decoder
 	ffmpegCmd    *exec.Cmd
 	ffmpegStdin  io.WriteCloser
 	h264Reader   *h264reader.H264Reader
-	
+
 	// コーデックタイプ
 	codecType string // "h264" または "h265"
 	props     props  // プロセッサ情報など
+
+	// 並列処理用フィールド
+	h264NALChan chan [][]byte // H.264 NALユニット処理用チャネル
+	h265NALChan chan [][]byte // H.265 NALユニット処理用チャネル
+	wg          sync.WaitGroup // ゴルーチン完了待機用
+	closeOnce   sync.Once      // チャネルクローズ処理の重複実行防止
 }
 
 // 接続が開かれたときに呼び出される
@@ -63,6 +69,19 @@ func (sh *serverHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionClo
 
 	sh.mutex.Lock()
 	defer sh.mutex.Unlock()
+
+	// チャネルをクローズし、処理ゴルーチンが終了するのを待つ
+	sh.closeOnce.Do(func() {
+		if sh.h264NALChan != nil {
+			close(sh.h264NALChan)
+			sh.h264NALChan = nil
+		}
+		if sh.h265NALChan != nil {
+			close(sh.h265NALChan)
+			sh.h265NALChan = nil
+		}
+	})
+	sh.wg.Wait() // 処理ゴルーチンの完了を待つ
 
 	// H.265トランスコーディングプロセスのクリーンアップ
 	if sh.ffmpegStdin != nil {
@@ -210,12 +229,24 @@ func (sh *serverHandler) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.
 // RECORDリクエストを受信したときに呼び出される
 func (sh *serverHandler) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
 	log.Printf("RTSP server: RECORDリクエストを受信 - ストリーミング開始 (コーデック: %s)", sh.codecType)
-	
+
 	// 事前にわかっているコーデックに基づいて効率的に処理
 	switch sh.codecType {
 	case "h264":
+		// H.264 NAL処理チャネルとゴルーチンを初期化
+		if sh.h264NALChan == nil {
+			sh.h264NALChan = make(chan [][]byte, 10) // バッファサイズ100
+			sh.wg.Add(1)
+			go sh.processH264NALs()
+		}
 		sh.setupH264PacketHandler(ctx)
 	case "h265":
+		// H.265 NAL処理チャネルとゴルーチンを初期化
+		if sh.h265NALChan == nil {
+			sh.h265NALChan = make(chan [][]byte, 10) // バッファサイズ100
+			sh.wg.Add(1)
+			go sh.processH265NALs()
+		}
 		sh.setupH265PacketHandler(ctx)
 	}
 
@@ -246,9 +277,16 @@ func (sh *serverHandler) setupH264PacketHandler(ctx *gortsplib.ServerHandlerOnRe
 		// アクセスユニットが有効な場合、WebRTCトラックに送信
 		if len(au) > 0 {
 			// フレームレートを30FPSと仮定してdurationを計算
-			duration := time.Second / 30
+			// duration := time.Second / 30
 			// writeNALsToTracks関数を呼び出してWebRTCクライアントに配信
-			writeNALsToTracks(au, duration)
+			// writeNALsToTracks(au, duration)
+			if sh.h264NALChan != nil {
+				select {
+				case sh.h264NALChan <- au:
+				default:
+					log.Printf("RTSP server: H.264 NALチャネルがブロックまたはクローズされています")
+				}
+			}
 		}
 	})
 }
@@ -274,7 +312,14 @@ func (sh *serverHandler) setupH265PacketHandler(ctx *gortsplib.ServerHandlerOnRe
 
 		// アクセスユニットが有効な場合、ffmpegプロセスに送信
 		if len(au) > 0 {
-			sh.writeH265ToTranscoder(au)
+			// sh.writeH265ToTranscoder(au)
+			if sh.h265NALChan != nil {
+				select {
+				case sh.h265NALChan <- au:
+				default:
+					log.Printf("RTSP server: H.265 NALチャネルがブロックまたはクローズされています")
+				}
+			}
 		}
 	})
 }
@@ -470,4 +515,31 @@ func (sh *serverHandler) streamTranscodedH264() {
 		duration := time.Second / 30 // 30FPS想定
 		writeNALsToTracks([][]byte{nal.Data}, duration)
 	}
+}
+
+// processH264NALs はh264NALChanからNALユニットを受信し処理します
+func (sh *serverHandler) processH264NALs() {
+	defer sh.wg.Done()
+	log.Printf("RTSP server: H.264 NAL処理ゴルーチン開始")
+	duration := time.Second / 30 // フレームレートを30FPSと仮定
+
+	for au := range sh.h264NALChan {
+		if len(au) > 0 {
+			writeNALsToTracks(au, duration)
+		}
+	}
+	log.Printf("RTSP server: H.264 NAL処理ゴルーチン終了")
+}
+
+// processH265NALs はh265NALChanからNALユニットを受信し処理します
+func (sh *serverHandler) processH265NALs() {
+	defer sh.wg.Done()
+	log.Printf("RTSP server: H.265 NAL処理ゴルーチン開始")
+
+	for au := range sh.h265NALChan {
+		if len(au) > 0 {
+			sh.writeH265ToTranscoder(au)
+		}
+	}
+	log.Printf("RTSP server: H.265 NAL処理ゴルーチン終了")
 }
