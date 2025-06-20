@@ -7,7 +7,7 @@
   <script defer>
     document.addEventListener("DOMContentLoaded", () => {
       console.log("DOMContentLoaded event fired."); 
-      const wsUrl = `wss://ws.zawa.dev/ws`;
+      const wsUrl = `ws://localhost:8080/ws`;
       const video = document.getElementById("remoteVideo");
       const ws = new WebSocket(wsUrl);
       let pc;

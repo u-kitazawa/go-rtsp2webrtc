@@ -226,8 +226,8 @@ func startGortsplibH265toH264RTSP(props props) {
     }
 
     // 並列処理用のチャネル（バッファサイズを調整して遅延を最小化）
-    nalChan := make(chan []byte, 5) // 小さなバッファで遅延最小化
-    h264NALChan := make(chan []byte, 5)
+    nalChan := make(chan []byte, 100) // バッファサイズ増加
+    h264NALChan := make(chan []byte, 100)
     
     // FFmpeg設定（さらに最適化）
     ffmpegArgs := []string{

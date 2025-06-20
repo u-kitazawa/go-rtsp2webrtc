@@ -46,9 +46,7 @@
           pc.ontrack = (e) => {
             console.log("pc.ontrack event:", e); 
             if (video.srcObject !== e.streams[0]) video.srcObject = e.streams[0];
-          };
-
-          // ICE候補が見つかったらサーバーに送信
+          };          // ICE候補が見つかったらサーバーに送信
           pc.onicecandidate = (event) => {
             if (event.candidate) {
               console.log("Buffering ICE candidate:", event.candidate.candidate);
@@ -64,6 +62,7 @@
                 console.log("Sending buffered ICE candidate:", candidate.candidate);
                 ws.send(JSON.stringify({ type: "candidate", candidate }));
               });
+              candidateQueue = []; // Clear the queue
             }
           };
 

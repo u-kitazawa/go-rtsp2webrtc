@@ -8,13 +8,14 @@ import (
 
 // --- トラックリストとミューテックス ---
 var (
-	inputURL     string // RTSP URL または RTP SDP ファイルパス
-	serverPort   string
-	codec        string // "h264" または "h265" (入力コーデック)
-	outputCodec  string // "h264" または "h265" (出力コーデック、H.265入力時のみ使用)
-	processor    string // H.265 トランスコーディング用の "cpu" または "gpu"
-	inputType    string // "rtsp" または "rtp" または "server"
-	useGortsplib string // gortsplib パススルー用の "true" または "false"
+	inputURL       string // RTSP URL または RTP SDP ファイルパス
+	serverPort     string
+	codec          string // "h264" または "h265" (入力コーデック)
+	outputCodec    string // "h264" または "h265" (出力コーデック、H.265入力時のみ使用)
+	processor      string // H.265 トランスコーディング用の "cpu" または "gpu"
+	inputType      string // "rtsp" または "rtp" または "server" または "rtp-server"
+	useGortsplib   string // gortsplib パススルー用の "true" または "false"
+	rtpServerAddr  string // RTP サーバーのリスニングアドレス
 )
 
 type props struct {
@@ -33,12 +34,12 @@ func main() {
 	flag.StringVar(&codec, "codec", "h264", "入力に使用するコーデック (h264 または h265)")
 	flag.StringVar(&outputCodec, "output-codec", "h264", "出力コーデック (h264 または h265) - H.265入力時のみ有効")
 	flag.StringVar(&processor, "processor", "cpu", "H.265トランスコーディングに使用するプロセッサ (cpu または gpu)")
-	flag.StringVar(&inputType, "input-type", "rtsp", "入力タイプ (rtsp, rtp, server)")	
+	flag.StringVar(&inputType, "input-type", "rtsp", "入力タイプ (rtsp, rtp, server, rtp-server)")	
 	flag.StringVar(&useGortsplib, "use-gortsplib", "false", "RTSPパススルーにgortsplibを使用する (true または false)")
+	flag.StringVar(&rtpServerAddr, "rtp-server-addr", ":5004", "RTPサーバーのリスニングアドレス (rtp-server モード時のみ)")
 	flag.Parse()
-
 	// サーバーモードの場合は入力URLチェックをスキップ
-	if inputType != "server" && inputURL == "" {
+	if inputType != "server" && inputType != "rtp-server" && inputURL == "" {
 		log.Fatal("入力URL（RTSPまたはRTP SDPファイル）を指定する必要があります。現在の入力タイプ: ", inputType)
 	}
 	
@@ -52,9 +53,11 @@ func main() {
 		log.Printf("警告: H.264入力からH.265出力への変換は現在サポートされていません。出力をH.264に設定します。")
 		outputCodec = "h264"
 	}
-	
-	if inputType == "server" {
-		log.Printf("入力タイプ: %s, コーデック: %s を使用します (RTSPサーバーモード)", inputType, codec)	} else {
+		if inputType == "server" {
+		log.Printf("入力タイプ: %s, コーデック: %s を使用します (RTSPサーバーモード)", inputType, codec)
+	} else if inputType == "rtp-server" {
+		log.Printf("入力タイプ: %s, コーデック: %s を使用します (RTPサーバーモード、リスニングアドレス: %s)", inputType, codec, rtpServerAddr)
+	} else {
 		log.Printf("入力URL: %s, 入力タイプ: %s, コーデック: %s を使用します", inputURL, inputType, codec)
 	}
 	
@@ -74,7 +77,8 @@ func main() {
 	
 	if useGortsplib == "true" {
 		log.Println("RTSPパススルーまたはトランスコーディングにgortsplibベースのハンドラーを使用します")
-		switch inputType {		case "server":
+		switch inputType {
+		case "server":
 			log.Println("RTSPサーバーモードでgortsplibベースのサーバーを起動します")
 			switch codec {
 			case "h264":
@@ -84,10 +88,32 @@ func main() {
 			default:
 				log.Fatalf("サポートされていないコーデック: %s。'h264' または 'h265' を使用してください。", codec)
 			}
-		default:
-			switch codec {			case "h264":
+		case "rtp-server":
+			log.Println("RTPサーバーモードで動的SDP受信サーバーを起動します")
+			go startRTPServer(rtpServerAddr)
+		case "rtp":
+			// RTP入力の場合は既存のRTPクライアントを使用
+			log.Printf("RTP入力が検出されました。RTPクライアントを使用します (コーデック: %s)", codec)
+			switch codec {
+			case "h264":
 				setCurrentCodec("h264")
-				go startGortsplibH264RTSP(props)			
+				go startRTPClient(props.inputURL)
+			case "h265":
+				if outputCodec == "h264" {
+					log.Println("H.265 RTP入力をH.264に変換してWebRTCにストリーミングします（注意: RTPクライアントは直接パススルーのみサポート）")
+					setCurrentCodec("h265") // RTPクライアントはパススルーのみ
+				} else {
+					setCurrentCodec("h265")
+				}				
+				go startRTPClient(props.inputURL)
+			default:
+				log.Fatalf("RTPクライアントは現在H.264およびH.265のみをサポートしています。指定されたコーデック: %s", codec)
+			}
+		default:
+			switch codec {
+			case "h264":
+				setCurrentCodec("h264")
+				go startGortsplibH264RTSP(props)
 			case "h265":
 				// H.265入力時の出力コーデックに基づいて処理を分岐
 				if outputCodec == "h264" {
@@ -104,14 +130,15 @@ func main() {
 			}
 		}
 	} else {
-		// 既存のffmpegベースのロジック (useGortsplib が "false" の場合)
-		log.Println("従来のffmpegベースのハンドラーを使用します")
+		// 既存のffmpegベースのロジック (useGortsplib が "false" の場合)		log.Println("従来のffmpegベースのハンドラーを使用します")
 		switch inputType {
 		case "server":
 			log.Fatal("サーバーモードはgortsplibが必要です。-use-gortsplib=true を指定してください")
+		case "rtp-server":
+			log.Println("RTPサーバーモードで動的SDP受信サーバーを起動します")
+			go startRTPServer(rtpServerAddr)
 		case "rtsp":
-			switch codec {
-			case "h264":
+			switch codec {			case "h264":
 				go startFFmpegH264RTSP(props.inputURL)
 			case "h265":
 				switch processor {
@@ -128,21 +155,30 @@ func main() {
 		case "rtp":
 			switch codec {
 			case "h264":
-				go startFFmpegH264RTP(inputURL)
+				setCurrentCodec("h264")
+				go startFFmpegH264RTP(inputURL) // ffmpegベースのH.264 RTP処理
 			case "h265":
-				switch processor {
-				case "gpu":
-					go startFFmpegH265ToH264NALGPURTP(inputURL)
-				case "cpu":
-					go startFFmpegH265ToH264NALCPURTP(inputURL)
-				default:
-					log.Fatalf("H.265のサポートされていないプロセッサ: %s。'cpu' または 'gpu' を使用してください。", processor)
+				if outputCodec == "h264" {
+					// H.265 -> H.264 トランスコーディング
+					switch processor {
+					case "gpu":
+						go startFFmpegH265ToH264NALGPURTP(inputURL)
+					case "cpu":
+						go startFFmpegH265ToH264NALCPURTP(inputURL)
+					default:
+						log.Fatalf("H.265のサポートされていないプロセッサ: %s。'cpu' または 'gpu' を使用してください。", processor)
+					}
+					setCurrentCodec("h264") // 出力はH.264
+				} else {
+					// H.265パススルー
+					setCurrentCodec("h265")
+					go startFFmpegH265RTP(inputURL) // ffmpegベースのH.265 RTPパススルー
 				}
 			default:
 				log.Fatalf("RTPのサポートされていないコーデック: %s", codec)
 			}
 		default:
-			log.Fatalf("サポートされていない入力タイプ: %s。'rtsp' または 'rtp' を使用してください。", inputType)
+			log.Fatalf("サポートされていない入力タイプ: %s。'rtsp', 'rtp', 'server', または 'rtp-server' を使用してください。", inputType)
 		}
 	}
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {

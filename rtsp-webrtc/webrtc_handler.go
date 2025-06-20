@@ -220,15 +220,19 @@ func setupPeerConnection() (*webrtc.PeerConnection, *webrtc.TrackLocalStaticSamp
 // --- PeerConnectionとH.265トラックのセットアップ (WebRTC用) ---
 func setupPeerConnectionH265() (*webrtc.PeerConnection, *webrtc.TrackLocalStaticSample) {
 	m := &webrtc.MediaEngine{}
-	// H.265コーデックの登録
-	_ = m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
+	// H.265コーデックの登録 - より適切なfmtpLineを使用
+	err := m.RegisterCodec(webrtc.RTPCodecParameters{		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH265,
 			ClockRate:   90000,
-			SDPFmtpLine: "profile-id=1",
+			SDPFmtpLine: "profile-id=1;level-id=93",
 		},
 		PayloadType: 97,
 	}, webrtc.RTPCodecTypeVideo)
+	if err != nil {
+		log.Printf("H.265コーデック登録失敗: %v", err)
+		return nil, nil
+	}
+	
 	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
 
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
@@ -239,17 +243,25 @@ func setupPeerConnectionH265() (*webrtc.PeerConnection, *webrtc.TrackLocalStatic
 		return nil, nil
 	}
 
+	// トラックを作成してからPeerConnectionに追加
 	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH265, ClockRate: 90000}, "video", "pion")
 	if err != nil {
+		log.Printf("H.265トラック作成失敗: %v", err)
 		_ = pc.Close()
 		return nil, nil
 	}
 
+	// 先にトラックを登録
+	registerTrackH265(track)
+
 	rtpSender, err := pc.AddTrack(track)
 	if err != nil {
+		log.Printf("H.265トラック追加失敗: %v", err)
+		unregisterTrackH265(track)
 		_ = pc.Close()
 		return nil, nil
 	}
+	
 	go func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
@@ -259,7 +271,6 @@ func setupPeerConnectionH265() (*webrtc.PeerConnection, *webrtc.TrackLocalStatic
 		}
 	}()
 
-	registerTrackH265(track)
 	return pc, track
 }
 

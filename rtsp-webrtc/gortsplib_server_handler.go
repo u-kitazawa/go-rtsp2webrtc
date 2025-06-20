@@ -235,7 +235,7 @@ func (sh *serverHandler) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*bas
 	case "h264":
 		// H.264 NAL処理チャネルとゴルーチンを初期化
 		if sh.h264NALChan == nil {
-			sh.h264NALChan = make(chan [][]byte, 10) // バッファサイズ100
+			sh.h264NALChan = make(chan [][]byte, 100) // バッファサイズ増加
 			sh.wg.Add(1)
 			go sh.processH264NALs()
 		}
@@ -243,7 +243,7 @@ func (sh *serverHandler) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*bas
 	case "h265":
 		// H.265 NAL処理チャネルとゴルーチンを初期化
 		if sh.h265NALChan == nil {
-			sh.h265NALChan = make(chan [][]byte, 10) // バッファサイズ100
+			sh.h265NALChan = make(chan [][]byte, 100) // バッファサイズ増加
 			sh.wg.Add(1)
 			go sh.processH265NALs()
 		}
